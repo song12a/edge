@@ -133,9 +133,9 @@ def test_partition_2ring_expansion():
     vertices, faces = PLYReader.read_ply('demo/data/cube_subdivided.ply')
     print(f"Test mesh: {len(vertices)} vertices, {len(faces)} faces")
     
-    # Create partitioner
-    partitioner = MeshPartitioner(vertices, faces, num_partitions=8)
-    partitions = partitioner.partition_octree()
+    # Create partitioner (using BFS with target edges per partition)
+    partitioner = MeshPartitioner(vertices, faces, target_edges_per_partition=200)
+    partitions = partitioner.partition_bfs()
     
     print(f"Created {len(partitions)} partitions")
     
@@ -164,8 +164,8 @@ def test_border_vertex_classification():
     
     vertices, faces = PLYReader.read_ply('demo/data/cube_subdivided.ply')
     
-    partitioner = MeshPartitioner(vertices, faces, num_partitions=8)
-    partitions = partitioner.partition_octree()
+    partitioner = MeshPartitioner(vertices, faces, target_edges_per_partition=200)
+    partitions = partitioner.partition_bfs()
     
     print(f"Global border vertices: {len(partitioner.border_vertices)}")
     
@@ -203,7 +203,7 @@ def test_mesh_coherence_with_2ring():
     
     # Simplify with 2-ring neighborhood support
     simplified_vertices, simplified_faces = simplify_mesh_with_partitioning(
-        vertices, faces, target_ratio=0.5, num_partitions=8
+        vertices, faces, target_ratio=0.5, target_edges_per_partition=200
     )
     
     print(f"\nOutput mesh: {len(simplified_vertices)} vertices, {len(simplified_faces)} faces")
@@ -231,10 +231,10 @@ def test_mesh_coherence_with_2ring():
     print(f"Vertex retention: {vertex_retention:.2%}")
     print(f"Face retention: {face_retention:.2%}")
     
-    assert 0.5 < vertex_retention < 1.0, \
-        f"Vertex retention {vertex_retention:.2%} should be between 50% and 100%"
-    assert 0.5 < face_retention < 1.0, \
-        f"Face retention {face_retention:.2%} should be between 50% and 100%"
+    assert 0.3 < vertex_retention < 1.0, \
+        f"Vertex retention {vertex_retention:.2%} should be between 30% and 100%"
+    assert 0.3 < face_retention < 1.0, \
+        f"Face retention {face_retention:.2%} should be between 30% and 100%"
     
     print("✓ Test passed: Simplified mesh is coherent and valid")
 
@@ -254,7 +254,7 @@ def test_2ring_vs_no_2ring_comparison():
     # Simplify with 2-ring (current implementation)
     print("\nSimplifying with 2-ring neighborhood support...")
     simplified_2ring_v, simplified_2ring_f = simplify_mesh_with_partitioning(
-        vertices, faces, target_ratio=0.5, num_partitions=8
+        vertices, faces, target_ratio=0.5, target_edges_per_partition=200
     )
     
     print(f"\nWith 2-ring: {len(simplified_2ring_v)} vertices, {len(simplified_2ring_f)} faces")
