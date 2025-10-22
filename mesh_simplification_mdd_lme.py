@@ -383,11 +383,17 @@ class LMESimplifier:
             border_edge = (v1 in self.border_vertices) or (v2 in self.border_vertices)
 
             # Before contraction, track vertex lineage (v2 merges into v1)
+            # Ensure both vertices have lineage entries
+            if v1 not in self.vertex_lineage:
+                self.vertex_lineage[v1] = {v1}
+            if v2 not in self.vertex_lineage:
+                self.vertex_lineage[v2] = {v2}
+            
+            # v1 now represents all vertices that v2 represented, plus itself
+            self.vertex_lineage[v1].update(self.vertex_lineage[v2])
+            
+            # Remove v2's lineage since it's been merged into v1
             if v2 in self.vertex_lineage:
-                if v1 not in self.vertex_lineage:
-                    self.vertex_lineage[v1] = {v1}
-                # v1 now represents all vertices that v2 represented, plus itself
-                self.vertex_lineage[v1].update(self.vertex_lineage[v2])
                 del self.vertex_lineage[v2]
 
             # Contract edge
@@ -401,6 +407,21 @@ class LMESimplifier:
 
         # Rebuild mesh
         self.base_simplifier.rebuild_mesh()
+        
+        # After rebuild, we need to update vertex_lineage to use new indices
+        # rebuild_mesh creates a mapping from old to new indices
+        valid_vertex_list = sorted(self.base_simplifier.valid_vertices)
+        old_to_new_vertex_map = {old_idx: new_idx for new_idx, old_idx in enumerate(valid_vertex_list)}
+        
+        # Create new lineage map with updated indices
+        new_vertex_lineage = {}
+        for old_idx, lineage_set in self.vertex_lineage.items():
+            if old_idx in old_to_new_vertex_map:
+                new_idx = old_to_new_vertex_map[old_idx]
+                new_vertex_lineage[new_idx] = lineage_set.copy()
+        
+        # Replace old lineage with new
+        self.vertex_lineage = new_vertex_lineage
 
         print(f"  Simplification complete: {len(self.base_simplifier.vertices)} vertices, "
               f"{len(self.base_simplifier.faces)} faces")
@@ -527,7 +548,7 @@ class MeshMerger:
 
     def merge_submeshes(self, submeshes: List[Dict], original_vertices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Merge multiple simplified sub-meshes into a single mesh.
+        Merge multiple simplified sub-meshes into a single mesh with improved deduplication.
 
         Args:
             submeshes: List of dictionaries containing:
@@ -535,14 +556,20 @@ class MeshMerger:
                 - 'faces': face array
                 - 'vertex_map': mapping from global to local indices (original mesh)
                 - 'reverse_map': mapping from local to global indices (original mesh)
+                - 'lineage_map': mapping from local to set of original global indices
             original_vertices: Original mesh vertices for position-based deduplication
 
         Returns:
             Tuple of (merged_vertices, merged_faces)
         """
-        vertex_global_to_merged = {}  # Maps original global vertex idx to merged mesh idx
-        vertex_position_map = {}  # Maps vertex positions to merged indices for tolerance-based matching
-        tolerance = 1e-6  # Tolerance for vertex position comparison
+        # Maps set of original vertex indices (frozenset) to merged mesh index
+        lineage_to_merged = {}
+        # Maps original global vertex idx to merged mesh idx
+        vertex_global_to_merged = {}
+        # Maps vertex positions to merged indices for tolerance-based matching
+        vertex_position_map = {}
+        # Improved tolerance for position-based matching
+        tolerance = 1e-4  # Increased from 1e-6 to handle boundary alignment better
 
         # First pass: collect all faces and determine which vertices are actually used
         temp_faces = []
@@ -555,10 +582,11 @@ class MeshMerger:
                 for v in face:
                     used_vertices.add((submesh_idx, v))
 
-        # Second pass: process only used vertices
+        # Second pass: process only used vertices with lineage-based deduplication
         for submesh_idx, submesh in enumerate(submeshes):
             vertices = submesh['vertices']
             reverse_map = submesh['reverse_map']
+            lineage_map = submesh.get('lineage_map', {})
 
             # Process only vertices that are actually used by faces
             for local_idx in range(len(vertices)):
@@ -567,26 +595,51 @@ class MeshMerger:
 
                 vertex = vertices[local_idx]
                 original_global_idx = reverse_map.get(local_idx)
+                lineage_set = lineage_map.get(local_idx, set())
+                
+                # If lineage is empty, use reverse_map as fallback
+                if len(lineage_set) == 0 and original_global_idx is not None:
+                    lineage_set = {original_global_idx}
 
-                # Check if this vertex was already added from another partition
-                if original_global_idx is not None and original_global_idx in vertex_global_to_merged:
-                    # Vertex already exists by original index, reuse it
-                    merged_idx = vertex_global_to_merged[original_global_idx]
-                else:
-                    # Check for duplicate by position
+                merged_idx = None
+
+                # Strategy 1: Match by lineage (most reliable)
+                # If this vertex represents the same set of original vertices, reuse it
+                if len(lineage_set) > 0:
+                    lineage_key = frozenset(lineage_set)
+                    if lineage_key in lineage_to_merged:
+                        merged_idx = lineage_to_merged[lineage_key]
+
+                # Strategy 2: Match by single original vertex index
+                # If this vertex has a single original index and it's already in the merged mesh
+                if merged_idx is None and len(lineage_set) == 1:
+                    single_orig_idx = next(iter(lineage_set))
+                    if single_orig_idx in vertex_global_to_merged:
+                        merged_idx = vertex_global_to_merged[single_orig_idx]
+                        # Also update lineage_to_merged for this case
+                        lineage_to_merged[frozenset(lineage_set)] = merged_idx
+
+                # Strategy 3: Match by position (fallback for vertices that moved)
+                if merged_idx is None:
                     vertex_key = tuple(np.round(vertex / tolerance).astype(int))
-
                     if vertex_key in vertex_position_map:
-                        # Found duplicate by position
                         merged_idx = vertex_position_map[vertex_key]
-                    else:
-                        # New vertex, add it
-                        merged_idx = len(self.merged_vertices)
-                        self.merged_vertices.append(vertex)
-                        vertex_position_map[vertex_key] = merged_idx
 
-                        if original_global_idx is not None:
-                            vertex_global_to_merged[original_global_idx] = merged_idx
+                # If no match found, create new vertex
+                if merged_idx is None:
+                    merged_idx = len(self.merged_vertices)
+                    self.merged_vertices.append(vertex)
+                    
+                    # Register in all maps
+                    vertex_key = tuple(np.round(vertex / tolerance).astype(int))
+                    vertex_position_map[vertex_key] = merged_idx
+                    
+                    if len(lineage_set) > 0:
+                        lineage_to_merged[frozenset(lineage_set)] = merged_idx
+                        # Also register individual original vertices
+                        for orig_idx in lineage_set:
+                            if orig_idx not in vertex_global_to_merged:
+                                vertex_global_to_merged[orig_idx] = merged_idx
 
                 # Map (submesh_idx, local_idx) to merged_idx
                 self.global_vertex_map[(submesh_idx, local_idx)] = merged_idx
@@ -614,6 +667,7 @@ class MeshMerger:
         print(f"  Total vertices in submeshes: {sum(len(s['vertices']) for s in submeshes)}")
         print(f"  Used vertices before deduplication: {len(used_vertices)}")
         print(f"  Unique vertices after deduplication: {len(merged_vertices_array)}")
+        print(f"  Vertices deduplicated by lineage: {len(lineage_to_merged)}")
         print(f"  Total faces before deduplication: {len(self.merged_faces)}")
         print(f"  Unique faces after deduplication: {len(merged_faces_array)}")
 
@@ -710,47 +764,27 @@ def simplify_mesh_with_partitioning(
         print(f"  Filtered faces: {len(simplified_faces)} -> {len(core_faces)} (core only)")
 
         # Create a reverse map for simplified vertices using vertex lineage
-        # This tracks which original global vertices each simplified vertex represents
+        # After rebuild_mesh, vertex_lineage uses the new (simplified) indices
         simplified_reverse_map = {}
         simplified_lineage_map = {}  # Maps simplified local idx to set of original global indices
 
-        # After rebuild_mesh, we need to map from the old local indices (used in lineage)
-        # to the new local indices in simplified_vertices
-        # The rebuild_mesh creates a mapping from old to new indices
-        old_to_new_map = {}
-        for new_idx in range(len(simplified_vertices)):
-            # Find which old index this corresponds to by position matching
-            best_old_idx = None
-            min_dist = float('inf')
-            for old_idx in vertex_lineage.keys():
-                if old_idx < len(submesh_vertices):
-                    dist = np.linalg.norm(simplified_vertices[new_idx] - submesh_vertices[old_idx])
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_old_idx = old_idx
-
-            if best_old_idx is not None and min_dist < 1e-5:
-                old_to_new_map[best_old_idx] = new_idx
-
-        # Now create the reverse maps using vertex lineage
+        # Map lineage to global indices
         for new_idx in range(len(simplified_vertices)):
             simplified_reverse_map[new_idx] = None
             simplified_lineage_map[new_idx] = set()
-
-            # Find the old index this new index came from
-            for old_idx, mapped_new_idx in old_to_new_map.items():
-                if mapped_new_idx == new_idx and old_idx in vertex_lineage:
-                    # Get all original vertices this represents
-                    original_local_indices = vertex_lineage[old_idx]
-                    # Convert to global indices
-                    for orig_local in original_local_indices:
-                        if orig_local in reverse_map:
-                            simplified_lineage_map[new_idx].add(reverse_map[orig_local])
-
-                    # For reverse_map, pick the first one (for backward compatibility)
-                    if len(simplified_lineage_map[new_idx]) > 0:
-                        simplified_reverse_map[new_idx] = min(simplified_lineage_map[new_idx])
-                    break
+            
+            # Check if this simplified vertex has lineage information
+            if new_idx in vertex_lineage:
+                # Get all original local vertices this represents
+                original_local_indices = vertex_lineage[new_idx]
+                # Convert to global indices
+                for orig_local in original_local_indices:
+                    if orig_local in reverse_map:
+                        simplified_lineage_map[new_idx].add(reverse_map[orig_local])
+                
+                # For reverse_map, pick the smallest one (most stable choice)
+                if len(simplified_lineage_map[new_idx]) > 0:
+                    simplified_reverse_map[new_idx] = min(simplified_lineage_map[new_idx])
 
         # Store simplified submesh with mappings (use core_faces instead of all faces)
         simplified_submeshes.append({
@@ -778,6 +812,13 @@ def simplify_mesh_with_partitioning(
           f"({100 * len(final_vertices) / len(vertices):.1f}%)")
     print(f"Reduction: {len(faces)} -> {len(final_faces)} faces "
           f"({100 * len(final_faces) / len(faces):.1f}%)")
+    
+    # Validation: vertex count should not increase
+    if len(final_vertices) > len(vertices):
+        print(f"\n⚠ WARNING: Vertex count INCREASED by {len(final_vertices) - len(vertices)} vertices!")
+        print(f"  This indicates a deduplication issue in the merging process.")
+    else:
+        print(f"✓ Vertex count reduced or maintained as expected")
 
     return final_vertices, final_faces
 
