@@ -466,24 +466,55 @@ class LMESimplifier:
             # Contract edge - v2 merges into v1 at optimal_pos
             self.base_simplifier.contract_edge(v1, v2, optimal_pos)
 
-            # Update vertex_edges structure: remove v2 and update edges
-            # Remove all edges involving v2
-            edges_to_remove = set()
+            # CRITICAL FIX: Rebuild edge connectivity from actual mesh
+            # After collapse, the mesh topology changes - v1 now connects to vertices that
+            # were previously only connected to v2. We must rebuild the connectivity graph
+            # to reflect the actual current mesh structure.
+            
+            # Rebuild vertex_edges for all affected vertices by extracting edges from current faces
+            vertices_to_update = affected_vertices.copy()
+            vertices_to_update.discard(v2)  # v2 is deleted
+            
+            for vertex in vertices_to_update:
+                if vertex not in self.base_simplifier.valid_vertices:
+                    continue
+                
+                # Clear old edges for this vertex
+                if vertex in vertex_edges:
+                    old_edges = vertex_edges[vertex].copy()
+                    # Remove this vertex from all its old edges
+                    for e in old_edges:
+                        for vx in [e[0], e[1]]:
+                            if vx in vertex_edges and vx != vertex:
+                                vertex_edges[vx].discard(e)
+                    vertex_edges[vertex].clear()
+                else:
+                    vertex_edges[vertex] = set()
+                
+                # Rebuild edges for this vertex from current mesh faces
+                if vertex in self.base_simplifier.vertex_faces:
+                    for face_idx in self.base_simplifier.vertex_faces[vertex]:
+                        if face_idx < len(self.base_simplifier.faces):
+                            face = self.base_simplifier.faces[face_idx]
+                            # Extract edges from this face
+                            for i in range(3):
+                                fv1, fv2 = face[i], face[(i + 1) % 3]
+                                if fv1 != fv2:  # Skip degenerate edges
+                                    edge_tuple = (min(fv1, fv2), max(fv1, fv2))
+                                    # Add edge to both vertices
+                                    if fv1 in self.base_simplifier.valid_vertices and fv2 in self.base_simplifier.valid_vertices:
+                                        if fv1 in vertex_edges:
+                                            vertex_edges[fv1].add(edge_tuple)
+                                        if fv2 in vertex_edges:
+                                            vertex_edges[fv2].add(edge_tuple)
+            
+            # Remove v2 from vertex_edges
             if v2 in vertex_edges:
-                for e in vertex_edges[v2]:
-                    edges_to_remove.add(e)
-                    # Remove this edge from all vertices that reference it
-                    for vx in [e[0], e[1]]:
-                        if vx in vertex_edges and vx != v2:
-                            vertex_edges[vx].discard(e)
                 del vertex_edges[v2]
             
-            # Also remove the collapsed edge from v1
-            vertex_edges[v1].discard(edge)
-            
             # Recompute LME for all affected vertices and add new LME edges to heap
-            for vertex in affected_vertices:
-                if vertex in self.base_simplifier.valid_vertices and vertex != v2:
+            for vertex in vertices_to_update:
+                if vertex in self.base_simplifier.valid_vertices:
                     lme_result = find_vertex_lme(vertex)
                     if lme_result:
                         new_cost, new_edge, new_optimal_pos = lme_result
