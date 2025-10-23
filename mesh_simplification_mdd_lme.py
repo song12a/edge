@@ -53,21 +53,23 @@ class MeshPartitioner:
     Implements the MDD (Minimal Simplification Domain) concept with 2-ring neighborhood support.
     """
 
-    def __init__(self, vertices: np.ndarray, faces: np.ndarray, num_partitions: int = 8):
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray, target_edges_per_partition: int = 200):
         """
         Initialize the mesh partitioner.
 
         Args:
             vertices: Array of vertex coordinates (N x 3)
             faces: Array of face indices (M x 3)
-            num_partitions: Number of spatial partitions (default: 8 for octree)
+            target_edges_per_partition: Target number of edges per partition (default: 200)
         """
         self.vertices = vertices
         self.faces = faces
-        self.num_partitions = num_partitions
+        self.target_edges_per_partition = target_edges_per_partition
         self.partitions = []
         self.border_vertices = set()  # Vertices on partition boundaries
         self.vertex_adjacency = None  # Will store vertex-to-vertex connectivity
+        self.edges = None  # Will store all edges in the mesh
+        self.edge_to_faces = None  # Maps edge to faces containing it
 
     def get_face_owner(self, face_idx: int, partitions: List[Dict]) -> int:
         """
@@ -95,6 +97,29 @@ class MeshPartitioner:
                     min_dist = dist
                     owner = p_idx
         return owner
+
+    def build_edges(self) -> Set[Tuple[int, int]]:
+        """
+        Build set of all edges in the mesh.
+        
+        Returns:
+            Set of edges as (v1, v2) tuples where v1 < v2
+        """
+        edges = set()
+        edge_to_faces = {}
+        
+        for face_idx, face in enumerate(self.faces):
+            for i in range(3):
+                v1, v2 = face[i], face[(i + 1) % 3]
+                edge = (min(v1, v2), max(v1, v2))
+                edges.add(edge)
+                if edge not in edge_to_faces:
+                    edge_to_faces[edge] = []
+                edge_to_faces[edge].append(face_idx)
+        
+        self.edges = edges
+        self.edge_to_faces = edge_to_faces
+        return edges
 
     def build_vertex_adjacency(self) -> Dict[int, Set[int]]:
         """
@@ -147,6 +172,166 @@ class MeshPartitioner:
             vertex_set = all_vertices.copy()  # Update to include all found so far
 
         return all_vertices
+
+    def partition_by_edge_count(self) -> List[Dict]:
+        """
+        Partition the mesh adaptively to keep approximately target_edges_per_partition edges in each partition.
+        Uses recursive octree subdivision.
+        
+        Returns:
+            List of partition dictionaries
+        """
+        # Build edges if not already built
+        if self.edges is None:
+            self.build_edges()
+        
+        total_edges = len(self.edges)
+        estimated_partitions = max(1, total_edges // self.target_edges_per_partition)
+        
+        # Determine octree depth needed
+        import math
+        depth = max(1, int(math.ceil(math.log(estimated_partitions, 8))))
+        
+        print(f"  Total edges: {total_edges}")
+        print(f"  Target edges per partition: {self.target_edges_per_partition}")
+        print(f"  Using octree depth: {depth} (up to {8**depth} partitions)")
+        
+        return self.partition_octree_adaptive(depth)
+    
+    def partition_octree_adaptive(self, depth: int = 1) -> List[Dict]:
+        """
+        Partition the mesh using adaptive octree subdivision with specified depth.
+        
+        Args:
+            depth: Octree subdivision depth (1 = 8 partitions, 2 = 64 partitions, etc.)
+        
+        Returns:
+            List of partition dictionaries
+        """
+        # Calculate bounding box
+        min_coords = np.min(self.vertices, axis=0)
+        max_coords = np.max(self.vertices, axis=0)
+        
+        # Assign each vertex to an octree cell
+        vertex_partitions = np.zeros(len(self.vertices), dtype=np.int32)
+        
+        for i, vertex in enumerate(self.vertices):
+            cell_idx = self._get_octree_cell(vertex, min_coords, max_coords, depth)
+            vertex_partitions[i] = cell_idx
+        
+        # Count partitions
+        num_partitions = 8 ** depth
+        partition_data = [{'core_vertices': set(), 'vertices': set(), 'faces': [], 
+                          'owned_faces': [], 'is_border': set(), 'edges': set()}
+                         for _ in range(num_partitions)]
+        
+        # First pass: assign vertices to their core partitions
+        for i in range(len(self.vertices)):
+            partition_idx = vertex_partitions[i]
+            partition_data[partition_idx]['core_vertices'].add(i)
+        
+        # Build edges for each partition
+        for edge in self.edges:
+            v1, v2 = edge
+            p1, p2 = vertex_partitions[v1], vertex_partitions[v2]
+            # Edge belongs to partition if both vertices are in it (or will be after 2-ring)
+            if p1 == p2:
+                partition_data[p1]['edges'].add(edge)
+        
+        # Second pass: expand each partition with 2-ring neighborhoods
+        print("  Computing 2-ring neighborhoods for each partition...")
+        for p_idx, p_data in enumerate(partition_data):
+            if len(p_data['core_vertices']) > 0:
+                extended_vertices = self.compute_n_ring_neighborhood(p_data['core_vertices'], n=2)
+                p_data['vertices'] = extended_vertices
+                
+                # Count edges in this partition (including 2-ring)
+                edge_count = 0
+                for edge in self.edges:
+                    v1, v2 = edge
+                    if v1 in extended_vertices and v2 in extended_vertices:
+                        edge_count += 1
+                
+                print(f"    Partition {p_idx}: {len(p_data['core_vertices'])} core vertices -> "
+                      f"{len(extended_vertices)} vertices with 2-ring, ~{edge_count} edges")
+        
+        # Third pass: assign faces to partitions and determine ownership
+        for face_idx, face in enumerate(self.faces):
+            v0, v1, v2 = face
+            core_partitions = {vertex_partitions[v0], vertex_partitions[v1], vertex_partitions[v2]}
+            
+            # Assign face to partitions where all vertices are in the extended vertex set
+            for p_idx, p_data in enumerate(partition_data):
+                if v0 in p_data['vertices'] and v1 in p_data['vertices'] and v2 in p_data['vertices']:
+                    p_data['faces'].append(face_idx)
+            
+            # Mark border vertices
+            if len(core_partitions) > 1:
+                for v in face:
+                    self.border_vertices.add(v)
+        
+        # Fourth pass: determine face ownership
+        for face_idx in range(len(self.faces)):
+            owner_idx = self.get_face_owner(face_idx, partition_data)
+            if face_idx in partition_data[owner_idx]['faces']:
+                partition_data[owner_idx]['owned_faces'].append(face_idx)
+        
+        # Fifth pass: identify border vertices for each partition
+        for p_idx, p_data in enumerate(partition_data):
+            for v in p_data['vertices']:
+                if v not in p_data['core_vertices']:
+                    p_data['is_border'].add(v)
+                elif v in self.border_vertices:
+                    p_data['is_border'].add(v)
+        
+        # Filter out empty partitions
+        self.partitions = [p for p in partition_data if len(p['faces']) > 0]
+        
+        return self.partitions
+    
+    def _get_octree_cell(self, vertex: np.ndarray, min_coords: np.ndarray, 
+                         max_coords: np.ndarray, depth: int) -> int:
+        """
+        Get octree cell index for a vertex at specified depth.
+        
+        Args:
+            vertex: Vertex coordinates
+            min_coords: Minimum coordinates of bounding box
+            max_coords: Maximum coordinates of bounding box
+            depth: Octree depth
+        
+        Returns:
+            Cell index
+        """
+        cell_idx = 0
+        current_min = min_coords.copy()
+        current_max = max_coords.copy()
+        
+        for d in range(depth):
+            center = (current_min + current_max) / 2
+            octant = 0
+            
+            if vertex[0] > center[0]:
+                octant += 1
+                current_min[0] = center[0]
+            else:
+                current_max[0] = center[0]
+            
+            if vertex[1] > center[1]:
+                octant += 2
+                current_min[1] = center[1]
+            else:
+                current_max[1] = center[1]
+            
+            if vertex[2] > center[2]:
+                octant += 4
+                current_min[2] = center[2]
+            else:
+                current_max[2] = center[2]
+            
+            cell_idx = cell_idx * 8 + octant
+        
+        return cell_idx
 
     def partition_octree(self) -> List[Dict]:
         """
@@ -281,9 +466,13 @@ class MeshPartitioner:
 class LMESimplifier:
     """
     Local Minimal Edges (LME) Simplifier that extends QEM to preserve border vertices.
+    Implements LME validation according to the paper:
+    - An edge is LME if its cost is minimal in its 2-ring neighborhood
+    - LME edges form an independent set (no shared vertices)
     """
 
-    def __init__(self, vertices: np.ndarray, faces: np.ndarray, border_vertices: Set[int]):
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray, border_vertices: Set[int],
+                 vertex_adjacency: Dict[int, Set[int]] = None):
         """
         Initialize the LME simplifier.
 
@@ -291,11 +480,109 @@ class LMESimplifier:
             vertices: Array of vertex coordinates
             faces: Array of face indices
             border_vertices: Set of vertex indices that are on partition borders
+            vertex_adjacency: Pre-computed vertex adjacency (optional)
         """
         self.base_simplifier = QEMSimplifier(vertices, faces)
         self.border_vertices = border_vertices
         # Track vertex merging: maps each vertex to the set of original vertices it represents
         self.vertex_merge_map = {i: {i} for i in range(len(vertices))}
+        
+        # Build vertex adjacency if not provided
+        if vertex_adjacency is None:
+            self.vertex_adjacency = self._build_vertex_adjacency()
+        else:
+            self.vertex_adjacency = vertex_adjacency
+    
+    def _build_vertex_adjacency(self) -> Dict[int, Set[int]]:
+        """Build vertex-to-vertex adjacency from faces."""
+        adjacency = {i: set() for i in range(len(self.base_simplifier.vertices))}
+        for face in self.base_simplifier.faces:
+            v0, v1, v2 = face
+            adjacency[v0].update([v1, v2])
+            adjacency[v1].update([v0, v2])
+            adjacency[v2].update([v0, v1])
+        return adjacency
+    
+    def _get_2ring_neighborhood(self, vertex: int) -> Set[int]:
+        """
+        Get 2-ring neighborhood of a vertex.
+        
+        Args:
+            vertex: Vertex index
+        
+        Returns:
+            Set of vertex indices in 2-ring neighborhood
+        """
+        if vertex not in self.vertex_adjacency:
+            return set()
+        
+        # 1-ring
+        one_ring = self.vertex_adjacency[vertex].copy()
+        one_ring.add(vertex)
+        
+        # 2-ring
+        two_ring = one_ring.copy()
+        for v in one_ring:
+            if v in self.vertex_adjacency:
+                two_ring.update(self.vertex_adjacency[v])
+        
+        return two_ring
+    
+    def _is_lme(self, edge: Tuple[int, int], edge_cost: float, 
+                all_edges: List[Tuple[float, int, int, np.ndarray]]) -> bool:
+        """
+        Check if an edge is a Local Minimal Edge (LME).
+        An edge is LME if its cost is minimal among all edges in its 2-ring neighborhood.
+        
+        Args:
+            edge: Edge as (v1, v2) tuple
+            edge_cost: Cost of this edge
+            all_edges: List of all edges with their costs as (cost, v1, v2, optimal_pos)
+        
+        Returns:
+            True if edge is LME, False otherwise
+        """
+        v1, v2 = edge
+        
+        # Get 2-ring neighborhood of both vertices
+        neighborhood = self._get_2ring_neighborhood(v1) | self._get_2ring_neighborhood(v2)
+        
+        # Check if any edge in the neighborhood has lower cost
+        for cost, e_v1, e_v2, _ in all_edges:
+            if cost >= edge_cost:
+                # Since edges are sorted, we can stop here
+                break
+            
+            # Check if this edge is in the neighborhood
+            if e_v1 in neighborhood or e_v2 in neighborhood:
+                # Found a lower-cost edge in neighborhood, so current edge is not LME
+                return False
+        
+        return True
+    
+    def _select_independent_lmes(self, lme_candidates: List[Tuple[float, int, int, np.ndarray]]) -> List[Tuple[float, int, int, np.ndarray]]:
+        """
+        Select independent LME edges (no shared vertices).
+        Uses greedy selection: process edges in order of increasing cost.
+        
+        Args:
+            lme_candidates: List of LME candidate edges as (cost, v1, v2, optimal_pos)
+        
+        Returns:
+            List of independent LME edges
+        """
+        independent_lmes = []
+        used_vertices = set()
+        
+        # Edges are already sorted by cost
+        for cost, v1, v2, optimal_pos in lme_candidates:
+            # Check if vertices are already used
+            if v1 not in used_vertices and v2 not in used_vertices:
+                independent_lmes.append((cost, v1, v2, optimal_pos))
+                used_vertices.add(v1)
+                used_vertices.add(v2)
+        
+        return independent_lmes
 
     def simplify(self, target_ratio: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -322,10 +609,9 @@ class LMESimplifier:
         # Find all valid edges
         edges = self.base_simplifier.find_valid_edges()
 
-        # Create priority queue, excluding edges involving border vertices
-        import heapq
-        heap = []
-
+        # Compute costs for all interior edges and store them
+        all_interior_edges = []
+        
         for edge in edges:
             v1, v2 = edge
             # Skip edges involving border vertices
@@ -337,7 +623,29 @@ class LMESimplifier:
 
             optimal_pos = self.base_simplifier.compute_optimal_position(v1, v2)
             cost = self.base_simplifier.compute_cost(v1, v2, optimal_pos)
-            heapq.heappush(heap, (cost, v1, v2, optimal_pos))
+            all_interior_edges.append((cost, v1, v2, optimal_pos))
+        
+        # Sort edges by cost
+        all_interior_edges.sort(key=lambda x: x[0])
+        
+        # Identify LME candidates (edges that are minimal in their 2-ring neighborhood)
+        print(f"  Identifying LME candidates from {len(all_interior_edges)} interior edges...")
+        lme_candidates = []
+        
+        for i, (cost, v1, v2, optimal_pos) in enumerate(all_interior_edges):
+            if self._is_lme((v1, v2), cost, all_interior_edges[:i]):
+                lme_candidates.append((cost, v1, v2, optimal_pos))
+        
+        print(f"  Found {len(lme_candidates)} LME candidates")
+        
+        # Select independent LMEs (no shared vertices)
+        independent_lmes = self._select_independent_lmes(lme_candidates)
+        print(f"  Selected {len(independent_lmes)} independent LMEs")
+        
+        # Create priority queue with LME edges
+        import heapq
+        heap = list(independent_lmes)
+        heapq.heapify(heap)
 
         # Perform edge contractions
         contraction_count = 0
@@ -375,6 +683,107 @@ class LMESimplifier:
               f"{len(self.base_simplifier.faces)} faces")
 
         return self.base_simplifier.vertices, self.base_simplifier.faces
+
+
+class BoundarySynchronizer:
+    """
+    Synchronizes boundary edge contractions across adjacent partitions.
+    Ensures that boundary vertices match exactly after simplification.
+    """
+    
+    def __init__(self, partitions: List[Dict], vertices: np.ndarray, faces: np.ndarray):
+        """
+        Initialize the boundary synchronizer.
+        
+        Args:
+            partitions: List of partition dictionaries
+            vertices: Original mesh vertices
+            faces: Original mesh faces
+        """
+        self.partitions = partitions
+        self.vertices = vertices
+        self.faces = faces
+        self.boundary_edges = {}  # Maps boundary edge -> list of partition indices
+        self._identify_boundary_edges()
+    
+    def _identify_boundary_edges(self):
+        """Identify edges that lie on partition boundaries."""
+        # Build edges for each partition
+        for p_idx, partition in enumerate(self.partitions):
+            core_verts = partition['core_vertices']
+            border_verts = partition['is_border']
+            
+            # Check edges in partition faces
+            for face_idx in partition['faces']:
+                face = self.faces[face_idx]
+                for i in range(3):
+                    v1, v2 = face[i], face[(i + 1) % 3]
+                    edge = (min(v1, v2), max(v1, v2))
+                    
+                    # Edge is boundary if at least one vertex is border
+                    if v1 in border_verts or v2 in border_verts:
+                        if edge not in self.boundary_edges:
+                            self.boundary_edges[edge] = []
+                        if p_idx not in self.boundary_edges[edge]:
+                            self.boundary_edges[edge].append(p_idx)
+    
+    def synchronize_boundary_contractions(self, simplifiers: List[LMESimplifier],
+                                         edge_contractions: List[Dict]) -> List[Dict]:
+        """
+        Synchronize boundary edge contractions across partitions.
+        
+        Args:
+            simplifiers: List of LMESimplifier instances for each partition
+            edge_contractions: List of edge contractions for each partition as
+                              {'edge': (v1, v2), 'optimal_pos': pos, 'global_v1': gv1, 'global_v2': gv2}
+        
+        Returns:
+            List of synchronized edge contractions for each partition
+        """
+        # Group boundary edges by their global indices
+        boundary_contraction_map = {}  # Maps global edge -> {'pos': optimal_pos, 'partitions': [p_idx, ...]}
+        
+        for p_idx, contractions in enumerate(edge_contractions):
+            for contraction in contractions.get('boundary_edges', []):
+                global_edge = contraction['global_edge']
+                edge = (min(global_edge), max(global_edge))
+                
+                if edge in boundary_contraction_map:
+                    # Edge already seen from another partition, verify position matches
+                    existing_pos = boundary_contraction_map[edge]['pos']
+                    new_pos = contraction['optimal_pos']
+                    
+                    # Use average position for consistency
+                    avg_pos = (existing_pos + new_pos) / 2
+                    boundary_contraction_map[edge]['pos'] = avg_pos
+                    boundary_contraction_map[edge]['partitions'].append(p_idx)
+                else:
+                    boundary_contraction_map[edge] = {
+                        'pos': contraction['optimal_pos'],
+                        'partitions': [p_idx]
+                    }
+        
+        # Update contractions with synchronized positions
+        synchronized_contractions = []
+        for p_idx in range(len(self.partitions)):
+            partition_contractions = []
+            
+            for contraction in edge_contractions[p_idx].get('boundary_edges', []):
+                global_edge = contraction['global_edge']
+                edge = (min(global_edge), max(global_edge))
+                
+                if edge in boundary_contraction_map:
+                    # Use synchronized position
+                    contraction['optimal_pos'] = boundary_contraction_map[edge]['pos']
+                
+                partition_contractions.append(contraction)
+            
+            synchronized_contractions.append({
+                'boundary_edges': partition_contractions,
+                'interior_edges': edge_contractions[p_idx].get('interior_edges', [])
+            })
+        
+        return synchronized_contractions
 
 
 class MeshMerger:
@@ -491,7 +900,8 @@ def simplify_mesh_with_partitioning(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_ratio: float = 0.5,
-    num_partitions: int = 8
+    num_partitions: int = None,
+    target_edges_per_partition: int = 200
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Simplify a mesh using partitioning, local simplification, and merging.
@@ -500,7 +910,8 @@ def simplify_mesh_with_partitioning(
         vertices: Input mesh vertices (N x 3)
         faces: Input mesh faces (M x 3)
         target_ratio: Target simplification ratio (0.5 = keep 50% of vertices)
-        num_partitions: Number of spatial partitions (default: 8 for octree)
+        num_partitions: (Deprecated) Number of partitions - kept for backward compatibility
+        target_edges_per_partition: Target number of edges per partition (default: 200)
 
     Returns:
         Tuple of (simplified_vertices, simplified_faces)
@@ -509,10 +920,10 @@ def simplify_mesh_with_partitioning(
     print(f"Input mesh: {len(vertices)} vertices, {len(faces)} faces")
     print(f"Target ratio: {target_ratio}")
 
-    # Step 1: Partition the mesh
-    print("\n[Step 1] Partitioning mesh...")
-    partitioner = MeshPartitioner(vertices, faces, num_partitions)
-    partitions = partitioner.partition_octree()
+    # Step 1: Partition the mesh by edge count
+    print("\n[Step 1] Partitioning mesh by edge count...")
+    partitioner = MeshPartitioner(vertices, faces, target_edges_per_partition)
+    partitions = partitioner.partition_by_edge_count()
     print(f"Created {len(partitions)} non-empty partitions")
     print(f"Border vertices: {len(partitioner.border_vertices)}")
 
@@ -628,7 +1039,7 @@ def process_ply_file(
     input_path: str,
     output_path: str,
     target_ratio: float = 0.5,
-    num_partitions: int = 8
+    target_edges_per_partition: int = 200
 ) -> bool:
     """
     Process a single PLY file with partitioned mesh simplification.
@@ -637,7 +1048,7 @@ def process_ply_file(
         input_path: Path to input PLY file
         output_path: Path to output PLY file
         target_ratio: Target simplification ratio
-        num_partitions: Number of spatial partitions
+        target_edges_per_partition: Target number of edges per partition
 
     Returns:
         True if successful, False otherwise
@@ -653,7 +1064,7 @@ def process_ply_file(
 
         # Simplify using partitioning
         simplified_vertices, simplified_faces = simplify_mesh_with_partitioning(
-            vertices, faces, target_ratio, num_partitions
+            vertices, faces, target_ratio, target_edges_per_partition
         )
 
         # Write output mesh
@@ -685,7 +1096,7 @@ def main():
 
     # Parameters
     simplification_ratio = 0.5  # Keep 50% of vertices
-    num_partitions = 8  # Octree partitioning (2x2x2)
+    target_edges_per_partition = 200  # Target edges per partition
 
     print("="*70)
     print("Mesh Simplification with MDD (Minimal Simplification Domain)")
@@ -695,7 +1106,7 @@ def main():
     print(f"  Input folder:  {input_folder}")
     print(f"  Output folder: {output_folder}")
     print(f"  Simplification ratio: {simplification_ratio}")
-    print(f"  Number of partitions: {num_partitions}")
+    print(f"  Target edges per partition: {target_edges_per_partition}")
 
     # Create output directory
     os.makedirs(output_folder, exist_ok=True)
@@ -724,7 +1135,7 @@ def main():
         output_filename = f"simplified_{filename}"
         output_path = os.path.join(output_folder, output_filename)
 
-        if process_ply_file(input_path, output_path, simplification_ratio, num_partitions):
+        if process_ply_file(input_path, output_path, simplification_ratio, target_edges_per_partition):
             successful += 1
         else:
             failed += 1
