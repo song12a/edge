@@ -336,15 +336,23 @@ class LMESimplifier:
         num_two_ring = len(self.two_ring_extension)
         num_interior = num_total - num_border - num_two_ring
         
-        # Calculate target, but ensure we don't over-simplify
-        # Minimum should be 4 vertices OR at least keep all border vertices to maintain structure
-        min_vertices = max(4, num_border)
-        target_vertex_count = max(min_vertices, int(num_total * target_ratio))
+        # Calculate base target
+        base_target = int(num_total * target_ratio)
         
-        # Additional safety: if almost all vertices are border/2-ring, be more conservative
-        if num_interior < num_total * 0.2:  # Less than 20% interior vertices
-            # Keep more vertices to maintain mesh structure
-            target_vertex_count = max(target_vertex_count, int(num_total * 0.7))
+        # CRITICAL FIX: Ensure target doesn't cause mesh expansion
+        # The target should ALWAYS be less than or equal to the original count
+        # Minimum should maintain border structure
+        min_vertices = max(4, num_border)
+        
+        # Clamp target to reasonable range: never less than min_vertices, never more than num_total
+        target_vertex_count = max(min_vertices, min(base_target, num_total))
+        
+        # Additional safety for partitions with very few interior vertices:
+        # Only apply conservative approach if the partition would collapse structure
+        if num_interior < 10 and num_total > 20:  # Very few interior vertices
+            # Use a more modest safety factor to avoid blocking all simplification
+            conservative_target = int(num_total * max(target_ratio, 0.6))
+            target_vertex_count = max(target_vertex_count, min(conservative_target, num_total))
             print(f"  ⚠ Warning: Partition has few interior vertices ({num_interior}/{num_total}), "
                   f"adjusting target to {target_vertex_count} to prevent over-simplification")
 
@@ -971,7 +979,7 @@ def main():
 
     # Parameters
     simplification_ratio = 0.5  # Keep 50% of vertices
-    target_edges_per_partition = 2000  # Target edges per partition
+    target_edges_per_partition = 500  # Target edges per partition (balance between quality and performance)
 
     print("="*70)
     print("Mesh Simplification with MDD (Minimal Simplification Domain)")
