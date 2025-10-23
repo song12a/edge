@@ -16,6 +16,37 @@ from QEM import PLYReader, PLYWriter, QEMSimplifier
 from typing import List, Tuple, Dict, Set
 
 
+def is_valid_triangle(v1: int, v2: int, v3: int, vertices: np.ndarray, min_area: float = 1e-10) -> bool:
+    """
+    Check if triangle is valid (non-degenerate).
+    
+    Args:
+        v1, v2, v3: Vertex indices of the triangle
+        vertices: Array of vertex coordinates
+        min_area: Minimum area threshold for valid triangle
+    
+    Returns:
+        True if triangle is valid, False otherwise
+    """
+    # Check for duplicate vertices
+    if v1 == v2 or v2 == v3 or v1 == v3:
+        return False
+    
+    # Check if indices are valid
+    if v1 >= len(vertices) or v2 >= len(vertices) or v3 >= len(vertices):
+        return False
+    
+    p1, p2, p3 = vertices[v1], vertices[v2], vertices[v3]
+    
+    # Check area
+    edge1 = p2 - p1
+    edge2 = p3 - p1
+    cross = np.cross(edge1, edge2)
+    area = np.linalg.norm(cross) / 2
+    
+    return area > min_area
+
+
 class MeshPartitioner:
     """
     Partitions a mesh into smaller sub-meshes based on spatial subdivision.
@@ -37,6 +68,33 @@ class MeshPartitioner:
         self.partitions = []
         self.border_vertices = set()  # Vertices on partition boundaries
         self.vertex_adjacency = None  # Will store vertex-to-vertex connectivity
+
+    def get_face_owner(self, face_idx: int, partitions: List[Dict]) -> int:
+        """
+        Determine which partition owns this face based on centroid.
+        
+        Args:
+            face_idx: Index of the face
+            partitions: List of partition dictionaries
+        
+        Returns:
+            Index of the partition that owns this face
+        """
+        face = self.faces[face_idx]
+        centroid = np.mean(self.vertices[face], axis=0)
+        
+        min_dist = float('inf')
+        owner = 0
+        for p_idx, partition in enumerate(partitions):
+            # Compute partition center from core vertices
+            core_verts = [self.vertices[v] for v in partition['core_vertices']]
+            if core_verts:
+                p_center = np.mean(core_verts, axis=0)
+                dist = np.linalg.norm(centroid - p_center)
+                if dist < min_dist:
+                    min_dist = dist
+                    owner = p_idx
+        return owner
 
     def build_vertex_adjacency(self) -> Dict[int, Set[int]]:
         """
@@ -124,7 +182,7 @@ class MeshPartitioner:
             vertex_partitions[i] = octant
 
         # Initialize partition data structures
-        partition_data = [{'core_vertices': set(), 'vertices': set(), 'faces': [], 'is_border': set()}
+        partition_data = [{'core_vertices': set(), 'vertices': set(), 'faces': [], 'owned_faces': [], 'is_border': set()}
                          for _ in range(8)]
 
         # First pass: assign vertices to their core partitions based on spatial position
@@ -142,16 +200,16 @@ class MeshPartitioner:
                 print(f"    Partition {p_idx}: {len(p_data['core_vertices'])} core vertices -> "
                       f"{len(extended_vertices)} vertices with 2-ring")
 
-        # Third pass: assign faces to partitions
-        # A face belongs to a partition's core if all its vertices are in core or immediate neighbors
-        # A face is in the extended set if it's needed for 2-ring context
+        # Third pass: assign faces to partitions and determine ownership
+        # A face belongs to a partition's extended set if all vertices are available (for 2-ring context)
+        # A face is OWNED by the partition closest to its centroid (for output)
         for face_idx, face in enumerate(self.faces):
             v0, v1, v2 = face
 
             # Determine which partition's core this face primarily belongs to
             core_partitions = {vertex_partitions[v0], vertex_partitions[v1], vertex_partitions[v2]}
 
-            # Assign face to partitions where all vertices are in the extended vertex set
+            # Assign face to partitions where all vertices are in the extended vertex set (for context)
             for p_idx, p_data in enumerate(partition_data):
                 if v0 in p_data['vertices'] and v1 in p_data['vertices'] and v2 in p_data['vertices']:
                     p_data['faces'].append(face_idx)
@@ -161,8 +219,16 @@ class MeshPartitioner:
             if len(core_partitions) > 1:
                 for v in face:
                     self.border_vertices.add(v)
+        
+        # Fourth pass: determine face ownership based on centroid (after all faces are assigned)
+        # Each face is owned by exactly one partition
+        for face_idx in range(len(self.faces)):
+            owner_idx = self.get_face_owner(face_idx, partition_data)
+            # Only add to owned_faces if this face exists in the partition's face list
+            if face_idx in partition_data[owner_idx]['faces']:
+                partition_data[owner_idx]['owned_faces'].append(face_idx)
 
-        # Fourth pass: identify border vertices for each partition
+        # Fifth pass: identify border vertices for each partition
         # Border vertices are those that should not be simplified:
         # 1. Vertices in the 2-ring extension (not in core)
         # 2. Vertices on the boundary between core partitions
@@ -228,6 +294,8 @@ class LMESimplifier:
         """
         self.base_simplifier = QEMSimplifier(vertices, faces)
         self.border_vertices = border_vertices
+        # Track vertex merging: maps each vertex to the set of original vertices it represents
+        self.vertex_merge_map = {i: {i} for i in range(len(vertices))}
 
     def simplify(self, target_ratio: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -285,6 +353,12 @@ class LMESimplifier:
             # Double-check border vertices (shouldn't happen but safety check)
             if v1 in self.border_vertices or v2 in self.border_vertices:
                 continue
+
+            # Track vertex merging: v1 absorbs v2
+            if v1 in self.vertex_merge_map and v2 in self.vertex_merge_map:
+                self.vertex_merge_map[v1] = self.vertex_merge_map[v1] | self.vertex_merge_map[v2]
+                # Remove v2's entry as it's now part of v1
+                del self.vertex_merge_map[v2]
 
             # Contract edge
             self.base_simplifier.contract_edge(v1, v2, optimal_pos)
@@ -379,12 +453,17 @@ class MeshMerger:
                 # Map (submesh_idx, local_idx) to merged_idx
                 self.global_vertex_map[(submesh_idx, local_idx)] = merged_idx
 
-        # Third pass: process faces
+        # Third pass: process faces with validation
         for submesh_idx, face in temp_faces:
             merged_face = [self.global_vertex_map[(submesh_idx, v)] for v in face]
             # Check for degenerate faces
             if len(set(merged_face)) == 3:
-                self.merged_faces.append(merged_face)
+                # Validate the triangle
+                v1, v2, v3 = merged_face
+                if v1 < len(self.merged_vertices) and v2 < len(self.merged_vertices) and v3 < len(self.merged_vertices):
+                    vertices_array = np.array(self.merged_vertices)
+                    if is_valid_triangle(v1, v2, v3, vertices_array):
+                        self.merged_faces.append(merged_face)
 
         # Remove duplicate faces (same vertices, regardless of order)
         unique_faces = []
@@ -462,57 +541,70 @@ def simplify_mesh_with_partitioning(
         simplifier = LMESimplifier(submesh_vertices, submesh_faces, local_border_vertices)
         simplified_vertices, simplified_faces = simplifier.simplify(target_ratio)
 
-        # Filter faces to only include those with at least one vertex from the core
-        # This ensures we don't duplicate faces from 2-ring extensions
-        core_faces = []
+        # Determine which faces are owned by this partition
+        # Use the owned_faces list from the partition to filter
+        owned_face_indices = set(partition['owned_faces'])
+        
+        # Create a set of vertices that appear in owned faces (in original submesh space)
+        owned_face_vertices = set()
+        for global_face_idx in owned_face_indices:
+            if global_face_idx in [partition['faces'][i] for i in range(len(partition['faces']))]:
+                # Find local face index
+                local_idx = partition['faces'].index(global_face_idx)
+                if local_idx < len(submesh_faces):
+                    owned_face_vertices.update(submesh_faces[local_idx])
+        
+        # Filter simplified faces: only keep faces where ALL vertices originated from owned face vertices
+        # This ensures we only output faces that truly belong to this partition
+        owned_simplified_faces = []
         for face in simplified_faces:
-            # Check if any vertex in the face maps back to a core vertex
-            face_has_core_vertex = False
-            for v_idx in face:
-                # Try to find which original vertex this simplified vertex came from
-                min_dist = float('inf')
-                best_orig_local = None
-                for orig_local_idx in range(len(submesh_vertices)):
-                    if v_idx < len(simplified_vertices):
-                        dist = np.linalg.norm(simplified_vertices[v_idx] - submesh_vertices[orig_local_idx])
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_orig_local = orig_local_idx
-
-                if best_orig_local is not None and min_dist < 1e-5 and best_orig_local in local_core_vertices:
-                    face_has_core_vertex = True
+            # Check if all vertices in this face originated from vertices in owned faces
+            all_from_owned = True
+            for v in face:
+                if v in simplifier.vertex_merge_map:
+                    # Get the original vertices that merged into this vertex
+                    orig_verts = simplifier.vertex_merge_map[v]
+                    # Check if at least one originated from an owned face vertex
+                    if not (orig_verts & owned_face_vertices):
+                        all_from_owned = False
+                        break
+                else:
+                    all_from_owned = False
                     break
+            
+            if all_from_owned:
+                # Validate the face is not degenerate
+                if len(set(face)) == 3 and is_valid_triangle(face[0], face[1], face[2], simplified_vertices):
+                    owned_simplified_faces.append(face)
 
-            if face_has_core_vertex:
-                core_faces.append(face)
+        print(f"  Filtered faces: {len(simplified_faces)} -> {len(owned_simplified_faces)} (owned only)")
 
-        print(f"  Filtered faces: {len(simplified_faces)} -> {len(core_faces)} (core only)")
-
-        # Create a reverse map for simplified vertices
-        # We need to track which original vertices each simplified vertex came from
+        # Create a reverse map for simplified vertices using the merge map
+        # Map simplified vertex indices to their original global vertex indices
         simplified_reverse_map = {}
-        for local_idx in range(len(simplified_vertices)):
-            # For now, we'll try to map back based on position matching
-            # This is approximate but necessary since simplification changes vertex count
-            simplified_reverse_map[local_idx] = None
+        for simplified_idx in range(len(simplified_vertices)):
+            if simplified_idx in simplifier.vertex_merge_map:
+                # Pick one representative original vertex (preferably a border vertex if possible)
+                orig_locals = simplifier.vertex_merge_map[simplified_idx]
+                # Prefer border vertices as they're more stable
+                border_orig = [ol for ol in orig_locals if ol in local_border_vertices]
+                if border_orig:
+                    representative = border_orig[0]
+                else:
+                    representative = min(orig_locals)  # Pick the first one
+                
+                # Map to global index
+                if representative in reverse_map:
+                    simplified_reverse_map[simplified_idx] = reverse_map[representative]
+                else:
+                    simplified_reverse_map[simplified_idx] = None
+            else:
+                simplified_reverse_map[simplified_idx] = None
 
-        # Try to match simplified vertices back to original vertices by position
-        for local_idx, simp_vert in enumerate(simplified_vertices):
-            min_dist = float('inf')
-            best_orig_idx = None
-            for orig_local_idx, orig_global_idx in reverse_map.items():
-                if orig_local_idx < len(submesh_vertices):
-                    dist = np.linalg.norm(simp_vert - submesh_vertices[orig_local_idx])
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_orig_idx = orig_global_idx
-            if min_dist < 1e-5:  # Close enough to consider it the same vertex
-                simplified_reverse_map[local_idx] = best_orig_idx
-
-        # Store simplified submesh with mappings (use core_faces instead of all faces)
+        # Store simplified submesh with mappings (use owned faces only)
         simplified_submeshes.append({
             'vertices': simplified_vertices,
-            'faces': core_faces,  # Only include core faces
+            'faces': owned_simplified_faces,  # Only include owned faces
             'vertex_map': vertex_map,
             'reverse_map': simplified_reverse_map
         })
