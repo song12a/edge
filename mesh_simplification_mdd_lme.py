@@ -332,15 +332,25 @@ class LMESimplifier:
         # Calculate target vertex count
         # Per paper: All vertices can be simplified, including 2-ring extension
         num_total = len(self.base_simplifier.vertices)
-        target_vertex_count = max(4, int(num_total * target_ratio))
-
         num_border = len(self.border_vertices)
         num_two_ring = len(self.two_ring_extension)
         num_interior = num_total - num_border - num_two_ring
+        
+        # Calculate target, but ensure we don't over-simplify
+        # Minimum should be 4 vertices OR at least keep all border vertices to maintain structure
+        min_vertices = max(4, num_border)
+        target_vertex_count = max(min_vertices, int(num_total * target_ratio))
+        
+        # Additional safety: if almost all vertices are border/2-ring, be more conservative
+        if num_interior < num_total * 0.2:  # Less than 20% interior vertices
+            # Keep more vertices to maintain mesh structure
+            target_vertex_count = max(target_vertex_count, int(num_total * 0.7))
+            print(f"  ⚠ Warning: Partition has few interior vertices ({num_interior}/{num_total}), "
+                  f"adjusting target to {target_vertex_count} to prevent over-simplification")
 
         print(f"  LME Simplification: {num_total} vertices ({num_two_ring} in 2-ring, "
               f"{num_border} border, {num_interior} interior)")
-        print(f"  Target: {target_vertex_count} vertices (all can be simplified per paper)")
+        print(f"  Target: {target_vertex_count} vertices (minimum: {min_vertices})")
 
         # Find all valid edges
         edges = self.base_simplifier.find_valid_edges()
