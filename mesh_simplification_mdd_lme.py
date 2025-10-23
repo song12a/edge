@@ -53,7 +53,8 @@ class MeshPartitioner:
     Implements the MDD (Minimal Simplification Domain) concept with 2-ring neighborhood support.
     """
 
-    def __init__(self, vertices: np.ndarray, faces: np.ndarray, target_edges_per_partition: int = 200):
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray, 
+                 target_edges_per_partition: int = 200, num_partitions: int = None):
         """
         Initialize the mesh partitioner.
 
@@ -61,10 +62,12 @@ class MeshPartitioner:
             vertices: Array of vertex coordinates (N x 3)
             faces: Array of face indices (M x 3)
             target_edges_per_partition: Target number of edges per partition (default: 200)
+            num_partitions: (Deprecated) Legacy parameter for backward compatibility
         """
         self.vertices = vertices
         self.faces = faces
         self.target_edges_per_partition = target_edges_per_partition
+        self.num_partitions = num_partitions if num_partitions is not None else 8
         self.partitions = []
         self.border_vertices = set()  # Vertices on partition boundaries
         self.vertex_adjacency = None  # Will store vertex-to-vertex connectivity
