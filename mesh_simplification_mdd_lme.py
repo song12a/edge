@@ -319,6 +319,9 @@ class LMESimplifier:
         """
         Simplify the mesh including boundary and 2-ring vertices, following the paper's approach.
         According to the paper, LME (Local Minimal Edges) within the 2-ring neighborhood can be simplified.
+        
+        This implementation ensures that for each vertex v_i, only the edge e(i,j) with the minimal
+        QEM cost among all edges connected to v_i is chosen for collapse.
 
         Args:
             target_ratio: Target ratio of vertices to retain
@@ -329,41 +332,106 @@ class LMESimplifier:
         # Calculate target vertex count
         # Per paper: All vertices can be simplified, including 2-ring extension
         num_total = len(self.base_simplifier.vertices)
-        target_vertex_count = max(4, int(num_total * target_ratio))
-
         num_border = len(self.border_vertices)
         num_two_ring = len(self.two_ring_extension)
         num_interior = num_total - num_border - num_two_ring
+        
+        # Calculate base target
+        base_target = int(num_total * target_ratio)
+        
+        # CRITICAL FIX: Ensure target doesn't cause mesh expansion
+        # The target should ALWAYS be less than or equal to the original count
+        # Minimum should maintain border structure
+        min_vertices = max(4, num_border)
+        
+        # Clamp target to reasonable range: never less than min_vertices, never more than num_total
+        target_vertex_count = max(min_vertices, min(base_target, num_total))
+        
+        # Additional safety for partitions with very few interior vertices:
+        # Only apply conservative approach if the partition would collapse structure
+        if num_interior < 10 and num_total > 20:  # Very few interior vertices
+            # Use a more modest safety factor to avoid blocking all simplification
+            conservative_target = int(num_total * max(target_ratio, 0.6))
+            target_vertex_count = max(target_vertex_count, min(conservative_target, num_total))
+            print(f"  ⚠ Warning: Partition has few interior vertices ({num_interior}/{num_total}), "
+                  f"adjusting target to {target_vertex_count} to prevent over-simplification")
 
         print(f"  LME Simplification: {num_total} vertices ({num_two_ring} in 2-ring, "
               f"{num_border} border, {num_interior} interior)")
-        print(f"  Target: {target_vertex_count} vertices (all can be simplified per paper)")
+        print(f"  Target: {target_vertex_count} vertices (minimum: {min_vertices})")
 
         # Find all valid edges
         edges = self.base_simplifier.find_valid_edges()
 
-        # Create priority queue
-        # Exclude edges involving 2-ring extension vertices only
-        import heapq
-        heap = []
+        # Helper function to compute edge cost with priority weighting
+        def compute_edge_cost(v1, v2):
+            """Compute cost for an edge with priority weighting."""
+            optimal_pos = self.base_simplifier.compute_optimal_position(v1, v2)
+            base_cost = self.base_simplifier.compute_cost(v1, v2, optimal_pos)
+            
+            # Prioritize interior edges, then boundary edges, then 2-ring extension edges
+            if v1 in self.two_ring_extension or v2 in self.two_ring_extension:
+                cost = base_cost * 1.2  # Lower priority for 2-ring extension edges
+            elif v1 in self.border_vertices or v2 in self.border_vertices:
+                cost = base_cost * 1.1  # Lower priority for boundary edges
+            else:
+                cost = base_cost
+            
+            return cost, optimal_pos
 
+        # Build vertex-to-edges mapping
+        import heapq
+        vertex_edges = {v: set() for v in self.base_simplifier.valid_vertices}
+        
         for edge in edges:
             v1, v2 = edge
+            if v1 in self.base_simplifier.valid_vertices and v2 in self.base_simplifier.valid_vertices:
+                vertex_edges[v1].add(edge)
+                vertex_edges[v2].add(edge)
 
-            if v1 not in self.base_simplifier.valid_vertices or v2 not in self.base_simplifier.valid_vertices:
-                continue
-
-            optimal_pos = self.base_simplifier.compute_optimal_position(v1, v2)
-            cost = self.base_simplifier.compute_cost(v1, v2, optimal_pos)
-
-            # Prioritize interior edges, then boundary edges, then 2-ring extension edges
-            # Per paper: all can be simplified, but prefer interior simplification first
-            if v1 in self.two_ring_extension or v2 in self.two_ring_extension:
-                cost *= 1.2  # Lower priority for 2-ring extension edges
-            elif v1 in self.border_vertices or v2 in self.border_vertices:
-                cost *= 1.1  # Lower priority for boundary edges
-
-            heapq.heappush(heap, (cost, v1, v2, optimal_pos))
+        # For each vertex, find the Local Minimal Edge (LME)
+        # LME for vertex v_i is the edge with minimal cost among all edges connected to v_i
+        def find_vertex_lme(vertex):
+            """Find the LME for a given vertex by recomputing costs for all its edges."""
+            if vertex not in vertex_edges or vertex not in self.base_simplifier.valid_vertices:
+                return None
+            
+            min_cost = float('inf')
+            min_edge = None
+            min_optimal_pos = None
+            
+            for edge in vertex_edges[vertex]:
+                v1, v2 = edge
+                # Check if both vertices are still valid
+                if v1 not in self.base_simplifier.valid_vertices or v2 not in self.base_simplifier.valid_vertices:
+                    continue
+                
+                # Recompute cost for this edge (critical for correctness after collapses)
+                cost, optimal_pos = compute_edge_cost(v1, v2)
+                
+                if cost < min_cost:
+                    min_cost = cost
+                    min_edge = edge
+                    min_optimal_pos = optimal_pos
+            
+            if min_edge is not None:
+                return (min_cost, min_edge, min_optimal_pos)
+            return None
+        
+        # Create priority queue with only LME edges
+        # An edge is added to the heap if it's the LME for at least one of its endpoints
+        heap = []
+        heap_edges = set()  # Track which edges are in heap
+        
+        # Initialize heap with LME edges
+        for vertex in self.base_simplifier.valid_vertices:
+            lme_result = find_vertex_lme(vertex)
+            if lme_result:
+                cost, edge, optimal_pos = lme_result
+                if edge not in heap_edges:
+                    v1, v2 = edge
+                    heapq.heappush(heap, (cost, v1, v2, optimal_pos))
+                    heap_edges.add(edge)
 
         # Track border vertex movements for later alignment
         self.border_vertex_mapping = {v: v for v in self.border_vertices}
@@ -374,13 +442,36 @@ class LMESimplifier:
 
         while current_vertex_count > target_vertex_count and heap:
             cost, v1, v2, optimal_pos = heapq.heappop(heap)
+            edge = (min(v1, v2), max(v1, v2))
+            heap_edges.discard(edge)
 
             # Check if vertices are still valid
             if v1 not in self.base_simplifier.valid_vertices or v2 not in self.base_simplifier.valid_vertices:
                 continue
+            
+            # Verify this edge is still the LME for at least one endpoint
+            # This prevents using stale heap entries
+            is_lme = False
+            
+            lme_v1 = find_vertex_lme(v1)
+            if lme_v1 and lme_v1[1] == edge:
+                is_lme = True
+            
+            lme_v2 = find_vertex_lme(v2)
+            if lme_v2 and lme_v2[1] == edge:
+                is_lme = True
+            
+            if not is_lme:
+                # This edge is no longer an LME for either endpoint, skip it
+                continue
 
-            # Track if this involves border vertices for alignment
-            border_edge = (v1 in self.border_vertices) or (v2 in self.border_vertices)
+            # Collect all vertices that will be affected by this collapse
+            affected_vertices = set()
+            for v in [v1, v2]:
+                if v in vertex_edges:
+                    for e in vertex_edges[v]:
+                        affected_vertices.add(e[0])
+                        affected_vertices.add(e[1])
 
             # Before contraction, track vertex lineage (v2 merges into v1)
             if v2 in self.vertex_lineage:
@@ -390,8 +481,53 @@ class LMESimplifier:
                 self.vertex_lineage[v1].update(self.vertex_lineage[v2])
                 del self.vertex_lineage[v2]
 
-            # Contract edge
+            # Contract edge - v2 merges into v1 at optimal_pos
             self.base_simplifier.contract_edge(v1, v2, optimal_pos)
+
+            # CRITICAL FIX: Completely rebuild vertex_edges from scratch
+            # This is simpler and more robust than trying to incrementally update.
+            # After collapse, mesh topology changes in complex ways, so rebuilding
+            # from the current mesh state is the most reliable approach.
+            
+            # Clear the entire vertex_edges structure and rebuild from actual mesh
+            vertex_edges.clear()
+            
+            # Rebuild vertex_edges from all current faces in the mesh
+            for v in self.base_simplifier.valid_vertices:
+                vertex_edges[v] = set()
+            
+            # Extract all edges from all faces
+            for v in self.base_simplifier.valid_vertices:
+                if v in self.base_simplifier.vertex_faces:
+                    for face_idx in self.base_simplifier.vertex_faces[v]:
+                        if face_idx < len(self.base_simplifier.faces):
+                            face = self.base_simplifier.faces[face_idx]
+                            # Extract edges from this face
+                            for i in range(3):
+                                fv1, fv2 = face[i], face[(i + 1) % 3]
+                                if fv1 != fv2:  # Skip degenerate edges
+                                    edge_tuple = (min(fv1, fv2), max(fv1, fv2))
+                                    # Add edge to both vertices
+                                    if fv1 in self.base_simplifier.valid_vertices and fv2 in self.base_simplifier.valid_vertices:
+                                        if fv1 in vertex_edges:
+                                            vertex_edges[fv1].add(edge_tuple)
+                                        if fv2 in vertex_edges:
+                                            vertex_edges[fv2].add(edge_tuple)
+            
+            # Now vertex_edges is completely fresh and accurate
+            vertices_to_update = affected_vertices.copy()
+            vertices_to_update.discard(v2)
+            
+            # Recompute LME for all affected vertices and add new LME edges to heap
+            for vertex in vertices_to_update:
+                if vertex in self.base_simplifier.valid_vertices:
+                    lme_result = find_vertex_lme(vertex)
+                    if lme_result:
+                        new_cost, new_edge, new_optimal_pos = lme_result
+                        if new_edge not in heap_edges:
+                            nv1, nv2 = new_edge
+                            heapq.heappush(heap, (new_cost, nv1, nv2, new_optimal_pos))
+                            heap_edges.add(new_edge)
 
             contraction_count += 1
             current_vertex_count = len(self.base_simplifier.valid_vertices)
@@ -843,7 +979,7 @@ def main():
 
     # Parameters
     simplification_ratio = 0.5  # Keep 50% of vertices
-    target_edges_per_partition = 2000  # Target edges per partition
+    target_edges_per_partition = 500  # Target edges per partition (balance between quality and performance)
 
     print("="*70)
     print("Mesh Simplification with MDD (Minimal Simplification Domain)")
