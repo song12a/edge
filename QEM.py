@@ -200,9 +200,34 @@ class QEMSimplifier:
 
     def is_valid_position(self, pos, v1, v2):
         """检查位置是否有效（在网格边界内）"""
-        # 这里可以添加更复杂的有效性检查
-        # 简单的检查：位置不是NaN或无穷大
-        return not (np.any(np.isnan(pos)) or np.any(np.isinf(pos)))
+        # 检查：位置不是NaN或无穷大
+        if np.any(np.isnan(pos)) or np.any(np.isinf(pos)):
+            return False
+        
+        # CRITICAL: Check that position is within reasonable bounds
+        # Position should not deviate too far from the edge endpoints
+        # This prevents extreme positions from QEM solver numerical issues
+        
+        # Get the two endpoint positions
+        p1 = self.vertices[v1]
+        p2 = self.vertices[v2]
+        
+        # Compute bounding box of the edge with some tolerance
+        edge_min = np.minimum(p1, p2)
+        edge_max = np.maximum(p1, p2)
+        edge_size = edge_max - edge_min
+        
+        # Allow position to be outside edge bbox by at most 2x the edge length in each dimension
+        # This handles cases where optimal position is slightly outside the edge
+        tolerance = 2.0
+        expanded_min = edge_min - tolerance * (edge_size + 1e-6)  # Add small epsilon to handle zero-length edges
+        expanded_max = edge_max + tolerance * (edge_size + 1e-6)
+        
+        # Check if position is within expanded bounds
+        if np.any(pos < expanded_min) or np.any(pos > expanded_max):
+            return False
+        
+        return True
 
     def compute_cost(self, v1, v2, optimal_pos):
         """计算边收缩的代价"""
