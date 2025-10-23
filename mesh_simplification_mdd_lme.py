@@ -485,6 +485,8 @@ class LMESimplifier:
             vertices_to_update = affected_vertices.copy()
             vertices_to_update.discard(v2)  # v2 is deleted
             
+            # PHASE 1: Clear all old edges for affected vertices
+            # This must be done in a separate pass to avoid mixing old and new edges
             for vertex in vertices_to_update:
                 if vertex not in self.base_simplifier.valid_vertices:
                     continue
@@ -500,6 +502,16 @@ class LMESimplifier:
                     vertex_edges[vertex].clear()
                 else:
                     vertex_edges[vertex] = set()
+            
+            # Remove v2 from vertex_edges
+            if v2 in vertex_edges:
+                del vertex_edges[v2]
+            
+            # PHASE 2: Rebuild edges from current mesh faces
+            # Now that all affected vertices are cleared, rebuild edges from actual mesh
+            for vertex in vertices_to_update:
+                if vertex not in self.base_simplifier.valid_vertices:
+                    continue
                 
                 # Rebuild edges for this vertex from current mesh faces
                 if vertex in self.base_simplifier.vertex_faces:
@@ -517,10 +529,6 @@ class LMESimplifier:
                                             vertex_edges[fv1].add(edge_tuple)
                                         if fv2 in vertex_edges:
                                             vertex_edges[fv2].add(edge_tuple)
-            
-            # Remove v2 from vertex_edges
-            if v2 in vertex_edges:
-                del vertex_edges[v2]
             
             # Recompute LME for all affected vertices and add new LME edges to heap
             for vertex in vertices_to_update:
