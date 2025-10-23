@@ -476,49 +476,22 @@ class LMESimplifier:
             # Contract edge - v2 merges into v1 at optimal_pos
             self.base_simplifier.contract_edge(v1, v2, optimal_pos)
 
-            # CRITICAL FIX: Rebuild edge connectivity from actual mesh
-            # After collapse, the mesh topology changes - v1 now connects to vertices that
-            # were previously only connected to v2. We must rebuild the connectivity graph
-            # to reflect the actual current mesh structure.
+            # CRITICAL FIX: Completely rebuild vertex_edges from scratch
+            # This is simpler and more robust than trying to incrementally update.
+            # After collapse, mesh topology changes in complex ways, so rebuilding
+            # from the current mesh state is the most reliable approach.
             
-            # Remove v2 from vertex_edges first
-            if v2 in vertex_edges:
-                del vertex_edges[v2]
+            # Clear the entire vertex_edges structure and rebuild from actual mesh
+            vertex_edges.clear()
             
-            # Collect ALL vertices whose edges need to be updated
-            # This includes affected_vertices AND any new neighbors discovered during rebuild
-            vertices_to_update = affected_vertices.copy()
-            vertices_to_update.discard(v2)  # v2 is deleted
+            # Rebuild vertex_edges from all current faces in the mesh
+            for v in self.base_simplifier.valid_vertices:
+                vertex_edges[v] = set()
             
-            # PHASE 1: Clear all old edges for affected vertices
-            # This must be done in a separate pass to avoid mixing old and new edges
-            for vertex in list(vertices_to_update):
-                if vertex not in self.base_simplifier.valid_vertices:
-                    continue
-                
-                # Clear old edges for this vertex
-                if vertex in vertex_edges:
-                    old_edges = vertex_edges[vertex].copy()
-                    # Remove this vertex from all its old edges
-                    for e in old_edges:
-                        for vx in [e[0], e[1]]:
-                            if vx in vertex_edges and vx != vertex:
-                                vertex_edges[vx].discard(e)
-                    vertex_edges[vertex].clear()
-                else:
-                    vertex_edges[vertex] = set()
-            
-            # PHASE 2: Rebuild edges from current mesh faces
-            # Discover and clear any additional vertices that weren't in affected_vertices
-            new_edges_to_add = []  # Collect edges first
-            
-            for vertex in list(vertices_to_update):
-                if vertex not in self.base_simplifier.valid_vertices:
-                    continue
-                
-                # Collect edges for this vertex from current mesh faces
-                if vertex in self.base_simplifier.vertex_faces:
-                    for face_idx in self.base_simplifier.vertex_faces[vertex]:
+            # Extract all edges from all faces
+            for v in self.base_simplifier.valid_vertices:
+                if v in self.base_simplifier.vertex_faces:
+                    for face_idx in self.base_simplifier.vertex_faces[v]:
                         if face_idx < len(self.base_simplifier.faces):
                             face = self.base_simplifier.faces[face_idx]
                             # Extract edges from this face
@@ -526,30 +499,16 @@ class LMESimplifier:
                                 fv1, fv2 = face[i], face[(i + 1) % 3]
                                 if fv1 != fv2:  # Skip degenerate edges
                                     edge_tuple = (min(fv1, fv2), max(fv1, fv2))
+                                    # Add edge to both vertices
                                     if fv1 in self.base_simplifier.valid_vertices and fv2 in self.base_simplifier.valid_vertices:
-                                        new_edges_to_add.append(edge_tuple)
-                                        # If we discover a vertex not in vertices_to_update, clear it now
-                                        for vx in [fv1, fv2]:
-                                            if vx not in vertices_to_update and vx in vertex_edges:
-                                                # Clear this newly discovered vertex
-                                                old_edges = vertex_edges[vx].copy()
-                                                for e in old_edges:
-                                                    for vy in [e[0], e[1]]:
-                                                        if vy in vertex_edges and vy != vx:
-                                                            vertex_edges[vy].discard(e)
-                                                vertex_edges[vx].clear()
-                                                vertices_to_update.add(vx)
-                                            elif vx not in vertex_edges:
-                                                vertex_edges[vx] = set()
-                                                vertices_to_update.add(vx)
+                                        if fv1 in vertex_edges:
+                                            vertex_edges[fv1].add(edge_tuple)
+                                        if fv2 in vertex_edges:
+                                            vertex_edges[fv2].add(edge_tuple)
             
-            # PHASE 3: Add all the new edges
-            for edge_tuple in new_edges_to_add:
-                fv1, fv2 = edge_tuple
-                if fv1 in vertex_edges:
-                    vertex_edges[fv1].add(edge_tuple)
-                if fv2 in vertex_edges:
-                    vertex_edges[fv2].add(edge_tuple)
+            # Now vertex_edges is completely fresh and accurate
+            vertices_to_update = affected_vertices.copy()
+            vertices_to_update.discard(v2)
             
             # Recompute LME for all affected vertices and add new LME edges to heap
             for vertex in vertices_to_update:
