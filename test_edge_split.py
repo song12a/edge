@@ -1,7 +1,14 @@
 """
 Test script to verify edge split fixes match C++ behavior
 """
+import os
 from edge_split import EdgeSplitter, PLYReader, PLYWriter
+
+
+# Test constants
+MAX_CURVATURE_THRESHOLD = 1000.0
+TEST_MAX_ITER = 1  # Consistent iterations for tests
+HISTOGRAM_TEST_ITER = 3  # Specific iteration count for histogram test
 
 
 def test_split_point_calculation():
@@ -67,7 +74,7 @@ def test_curvature_calculation():
     print(f"Curvature values: min={min(curvature):.6f}, max={max(curvature):.6f}, avg={sum(curvature)/len(curvature):.6f}")
     
     # All curvature values should be finite
-    all_finite = all(abs(c) < 1000 for c in curvature)
+    all_finite = all(abs(c) < MAX_CURVATURE_THRESHOLD for c in curvature)
     
     if all_finite:
         print("✓ PASS: All curvature values are finite")
@@ -103,7 +110,7 @@ def test_histogram_mode():
     print(f"Original mesh: {len(vertices)} vertices, {len(faces)} faces")
     
     # Test histogram mode
-    new_vertices, new_faces = splitter.split_edges(mode="histogram", max_iter=3)
+    new_vertices, new_faces = splitter.split_edges(mode="histogram", max_iter=HISTOGRAM_TEST_ITER)
     
     print(f"After histogram split: {len(new_vertices)} vertices, {len(new_faces)} faces")
     
@@ -124,31 +131,53 @@ def test_comparison_with_original():
     print("Test 4: Behavior Comparison")
     print("=" * 60)
     
-    # Load test mesh
+    # Use test mesh file if it exists, otherwise create a simple one
+    test_file = "demo/output/simplified_00011000_8a21002f126e4425a811e70a_trimesh_004.ply"
+    
+    if not os.path.exists(test_file):
+        print(f"Test file not found: {test_file}")
+        print("Creating simple test mesh instead...")
+        vertices = [
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]
+        ]
+        faces = [
+            [0, 1, 2], [0, 2, 3],
+            [4, 6, 5], [4, 7, 6],
+            [0, 5, 1], [0, 4, 5],
+            [3, 2, 6], [3, 6, 7],
+            [0, 3, 7], [0, 7, 4],
+            [1, 5, 6], [1, 6, 2]
+        ]
+    else:
+        try:
+            reader = PLYReader()
+            vertices, faces = reader.read_ply(test_file)
+        except (FileNotFoundError, IOError, ValueError) as e:
+            print(f"Error loading test file: {e}")
+            return False
+    
     try:
-        reader = PLYReader()
-        vertices, faces = reader.read_ply("demo/output/simplified_00011000_8a21002f126e4425a811e70a_trimesh_004.ply")
-        
         print(f"Loaded mesh: {len(vertices)} vertices, {len(faces)} faces")
         
         # Test subremeshing
         splitter1 = EdgeSplitter()
         splitter1.initialize(vertices, faces)
-        v1, f1 = splitter1.split_edges(mode="subremeshing", max_iter=1)
+        v1, f1 = splitter1.split_edges(mode="subremeshing", max_iter=TEST_MAX_ITER)
         
         print(f"Subremeshing result: {len(v1)} vertices, {len(f1)} faces")
         
         # Test histogram
         splitter2 = EdgeSplitter()
         splitter2.initialize(vertices, faces)
-        v2, f2 = splitter2.split_edges(mode="histogram", max_iter=1)
+        v2, f2 = splitter2.split_edges(mode="histogram", max_iter=TEST_MAX_ITER)
         
         print(f"Histogram result: {len(v2)} vertices, {len(f2)} faces")
         
         print("✓ PASS: Both modes executed successfully")
         return True
         
-    except Exception as e:
+    except (ValueError, IndexError, KeyError) as e:
         print(f"✗ FAIL: Error during execution: {e}")
         import traceback
         traceback.print_exc()
