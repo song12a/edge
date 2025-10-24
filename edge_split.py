@@ -437,8 +437,15 @@ class EdgeSplitter:
             if not split_list:
                 break
 
+            # Track which edges have been split
+            split_edges = set()
+            for (bs1, bs2, n) in split_list:
+                split_edges.add((min(bs1, bs2), max(bs1, bs2)))
+
             points_end_idx = len(points_out)
             new_faces = []
+            processed_triangles = set()  # Track which triangles have been subdivided
+            
             for (bs1, bs2, n) in split_list:
                 if not all(self._is_valid_index(i, len(points_out)) for i in [bs1, bs2]):
                     continue
@@ -457,7 +464,12 @@ class EdgeSplitter:
                 triangle_vertices = [v for v in bs3_list if
                                      v != bs1 and v != bs2 and self._is_valid_index(v, len(points_out))]
 
+                # Mark triangles containing this split edge as processed
                 for tv in triangle_vertices:
+                    # Create a canonical representation of the triangle
+                    tri = tuple(sorted([bs1, bs2, tv]))
+                    processed_triangles.add(tri)
+                    
                     self._local_reconnection(
                         points_out, neighbor_out, faces_out, new_faces,
                         bs1, bs2, tv, new_point_indices, n, E_ave
@@ -467,10 +479,18 @@ class EdgeSplitter:
                     neighbor_out, bs1, bs2, new_point_indices, n
                 )
 
+            # Remove old faces that were subdivided
+            faces_to_keep = []
+            for face in faces_out:
+                tri = tuple(sorted(face))
+                if tri not in processed_triangles:
+                    faces_to_keep.append(face)
+            
+            faces_out = faces_to_keep
+            faces_out.extend(new_faces)
+
             for i in range(original_number, len(neighbor_out)):
                 neighbor_out[i] = self._structure_remove_repeat(neighbor_out[i])
-
-            faces_out.extend(new_faces)
 
         return points_out, faces_out
 
@@ -534,49 +554,23 @@ class EdgeSplitter:
                             faces: List[Triangle], new_faces: List[Triangle],
                             bs1: int, bs2: int, tv: int, new_points: List[int],
                             n: int, E_ave: float) -> None:
-        len12 = self._edge_length(points[bs1], points[bs2])
-        len13 = self._edge_length(points[bs1], points[tv])
-        len23 = self._edge_length(points[bs2], points[tv])
-
-        # 修正：完整实现三种情况
-        if len13 <= 2 * E_ave and len23 <= 2 * E_ave:
-            # 情况1：三条边都相对较短，在所有边上插入点
-            p13_points = self._insert_points_on_edge(points, bs1, tv, n)
-            p23_points = self._insert_points_on_edge(points, bs2, tv, n)
-            p13_indices = list(range(len(points), len(points) + n))
-            p23_indices = list(range(p13_indices[-1] + 1, p13_indices[-1] + 1 + n)) if n > 0 else []
-            points.extend(p13_points + p23_points)
-
-            # 创建均匀的四边形网格
-            for k in range(n):
-                if k >= len(new_points) or k >= len(p13_indices) or k >= len(p23_indices):
-                    continue
-                v1 = new_points[k]
-                v2 = p13_indices[k]
-                v3 = tv
-                v4 = p23_indices[k]
-                if all(self._is_valid_index(i, len(points)) for i in [v1, v2, v3, v4]):
-                    self._split_quadrilateral(neighbors, new_faces, v1, v2, v3, v4)
-        else:
-            # 情况2和3：根据边长和角度决定分割策略
-            edges = [(len12, bs1, bs2), (len13, bs1, tv), (len23, bs2, tv)]
-            edges.sort(reverse=True, key=lambda x: x[0])
-            (_, l1, l2), (_, s1, s2) = edges[:2]
-
-            long_points = self._insert_points_on_edge(points, l1, l2, n)
-            second_points = self._insert_points_on_edge(points, s1, s2, n)
-            long_indices = list(range(len(points), len(points) + n))
-            second_indices = list(range(long_indices[-1] + 1, long_indices[-1] + 1 + n)) if n > 0 else []
-            points.extend(long_points + second_points)
-
-            # 使用点配对算法
-            for k in range(n):
-                if k >= len(long_indices) or k >= len(second_indices):
-                    continue
-                v1 = long_indices[k]
-                v2 = second_indices[k]
-                if all(self._is_valid_index(i, len(points)) for i in [v1, v2, l1, s1]):
-                    self._split_quadrilateral(neighbors, new_faces, v1, v2, l1, s1)
+        """
+        Subdivide triangle (bs1, bs2, tv) where edge bs1-bs2 has been split with new points.
+        Creates new triangular faces connecting the split edge points to tv.
+        """
+        if n == 0 or len(new_points) == 0:
+            return
+        
+        # Create triangles connecting consecutive points on the split edge to tv
+        # Triangle: bs1 - new_points[0] - tv
+        new_faces.append([bs1, new_points[0], tv])
+        
+        # Intermediate triangles: new_points[i-1] - new_points[i] - tv
+        for i in range(1, len(new_points)):
+            new_faces.append([new_points[i-1], new_points[i], tv])
+        
+        # Final triangle: new_points[-1] - bs2 - tv
+        new_faces.append([new_points[-1], bs2, tv])
 
     def _insert_points_on_edge(self, points: List[Point], p1: int, p2: int, n: int) -> List[Point]:
         if not all(self._is_valid_index(i, len(points)) for i in [p1, p2]) or n <= 0:
