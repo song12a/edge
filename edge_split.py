@@ -193,34 +193,171 @@ class EdgeSplitter:
         return unique
 
     def compute_harmonic_like_measure(self) -> List[float]:
+        """
+        实现与C++MeshGeometric_Harmonic_N_Value一致的曲率计算
+        使用余切权重和距离权重进行平滑处理
+        """
         N = [0.0] * len(self.points)
+        
+        # 步骤1: 初始化N值和余切权重
+        pointsN_withoutzRepeat = []
+        ctan_weight_v = []
+        distance_v = []
+        
         for i in range(len(self.points)):
             ni = self._vertex_normal(i)
-            neigh = self._unique_neighbors(i)
+            points_i = self.points[i]
+            pointsN_withoutzRepeat_i = []
+            distance_i = []
             angle_sum = 0.0
-            if not neigh:
-                N[i] = 0.0
-                continue
-            for nb in neigh:
-                nj = self._vertex_normal(nb)
-                angle_sum += self._angle_between(ni, nj)
-            N[i] = angle_sum / len(neigh)
-
-        for _ in range(3):
-            new_N = N.copy()
-            for i in range(len(self.points)):
-                neigh = self._unique_neighbors(i)
-                if not neigh:
+            
+            # 计算邻居点和距离
+            for j in range(0, len(self.point_neighbor[i]), 2):
+                if j + 1 >= len(self.point_neighbor[i]):
                     continue
-                weight_sum = 0.0
-                weighted_sum = 0.0
-                for nb in neigh:
-                    weight = self._edge_length(self.points[i], self.points[nb])
-                    weight_sum += weight
-                    weighted_sum += weight * N[nb]
-                new_N[i] = weighted_sum / weight_sum if weight_sum != 0 else N[i]
-            N = new_N
-        return N
+                p2 = self.point_neighbor[i][j]
+                p3 = self.point_neighbor[i][j + 1]
+                
+                if not self._is_valid_index(p2) or not self._is_valid_index(p3):
+                    continue
+                
+                # 计算距离
+                dpi2 = self._edge_length(points_i, self.points[p2])
+                dpi3 = self._edge_length(points_i, self.points[p3])
+                
+                # 计算法向量夹角
+                p2n = self._vertex_normal(p2)
+                p3n = self._vertex_normal(p3)
+                
+                # 处理零法向量
+                if all(abs(x) < 1e-10 for x in p2n):
+                    p2n = p3n
+                if all(abs(x) < 1e-10 for x in p3n):
+                    p3n = p2n
+                
+                a2 = self._angle_between(ni, p2n)
+                a3 = self._angle_between(ni, p3n)
+                angle_sum += a2 + a3
+                
+                # 添加唯一邻居
+                if p2 not in pointsN_withoutzRepeat_i:
+                    pointsN_withoutzRepeat_i.append(p2)
+                    distance_i.append(dpi2)
+                if p3 not in pointsN_withoutzRepeat_i:
+                    pointsN_withoutzRepeat_i.append(p3)
+                    distance_i.append(dpi3)
+            
+            # 计算余切权重
+            p1_Neighbor = self.point_neighbor[i]
+            ctan_weight = [0.0] * len(pointsN_withoutzRepeat_i)
+            
+            for j, p2 in enumerate(pointsN_withoutzRepeat_i):
+                # 找到包含p2的相邻三角形
+                for k in range(0, len(p1_Neighbor), 2):
+                    if k + 1 >= len(p1_Neighbor):
+                        continue
+                    p21 = p1_Neighbor[k]
+                    p22 = p1_Neighbor[k + 1]
+                    
+                    if p21 == p2:
+                        p2_real = p22
+                    elif p22 == p2:
+                        p2_real = p21
+                    else:
+                        continue
+                    
+                    if not self._is_valid_index(p2_real):
+                        continue
+                    
+                    # 计算角度 p2_real-i-p2 的内角
+                    angle = self._compute_inner_angle(p2_real, i, p2)
+                    tan_value = abs(math.tan(angle))
+                    
+                    # 限制tan值范围
+                    tan_value = max(0.1, min(tan_value, 10.0))
+                    
+                    # 余切权重 = 1/tan
+                    ctan_weight[j] += 1.0 / tan_value
+            
+            ctan_weight_v.append(ctan_weight)
+            pointsN_withoutzRepeat.append(pointsN_withoutzRepeat_i)
+            distance_v.append(distance_i)
+            
+            # 初始N值
+            if len(self.point_neighbor[i]) > 0:
+                N[i] = angle_sum / len(self.point_neighbor[i])
+            else:
+                N[i] = 0.0
+        
+        # 步骤2: 使用距离加权归一化余切权重
+        ctan_weight_v_f = []
+        for i in range(len(self.points)):
+            ctan_weight_i = ctan_weight_v[i]
+            pointsN_withoutzRepeat_i = pointsN_withoutzRepeat[i]
+            distance_i = distance_v[i]
+            
+            if len(pointsN_withoutzRepeat_i) == 0:
+                ctan_weight_v_f.append([])
+                continue
+            
+            # 计算权重和
+            sum_weight = sum(ctan_weight_i[j] / distance_i[j] 
+                           for j in range(len(pointsN_withoutzRepeat_i)) 
+                           if distance_i[j] > 0)
+            
+            # 归一化
+            if sum_weight > 0:
+                ctan_weight_i_f = [(ctan_weight_i[j] / distance_i[j]) / sum_weight 
+                                  for j in range(len(pointsN_withoutzRepeat_i))]
+            else:
+                ctan_weight_i_f = [0.0] * len(pointsN_withoutzRepeat_i)
+            
+            ctan_weight_v_f.append(ctan_weight_i_f)
+        
+        # 步骤3: 平滑处理（3次迭代，lambda=0.5）
+        HN_Value = N.copy()
+        landa = 0.5
+        
+        for _ in range(3):
+            new_HN = HN_Value.copy()
+            for i in range(len(self.points)):
+                if len(pointsN_withoutzRepeat[i]) == 0:
+                    continue
+                
+                ctan_weight_i = ctan_weight_v_f[i]
+                pointsN_withoutzRepeat_i = pointsN_withoutzRepeat[i]
+                
+                HN_i = sum(ctan_weight_i[j] * HN_Value[pointsN_withoutzRepeat_i[j]]
+                          for j in range(len(pointsN_withoutzRepeat_i)))
+                
+                new_HN[i] = HN_Value[i] * landa + HN_i * (1 - landa)
+            
+            HN_Value = new_HN
+        
+        return HN_Value
+    
+    def _compute_inner_angle(self, p1: int, p2: int, p3: int) -> float:
+        """计算角度p1-p2-p3（在p2处的内角）"""
+        if not all(self._is_valid_index(i) for i in [p1, p2, p3]):
+            return 0.0
+        
+        p1p = self.points[p1]
+        p2p = self.points[p2]
+        p3p = self.points[p3]
+        
+        # 向量 p2->p1 和 p2->p3
+        pn1 = [p1p[0] - p2p[0], p1p[1] - p2p[1], p1p[2] - p2p[2]]
+        pn2 = [p3p[0] - p2p[0], p3p[1] - p2p[1], p3p[2] - p2p[2]]
+        
+        # 归一化
+        pn1 = self._unit(pn1)
+        pn2 = self._unit(pn2)
+        
+        # 计算夹角
+        cosa1 = sum(pn1[k] * pn2[k] for k in range(3))
+        cosa1 = max(min(cosa1, 1.0), -1.0)
+        
+        return math.acos(cosa1)
 
     def _init_histogram_factors(self) -> None:
         if not self.cu_ave:
@@ -247,18 +384,18 @@ class EdgeSplitter:
         li3 = sorted_cu[index_c_base + unit_max] if index_c_base + unit_max < max_idx else sorted_cu[-1]
         li4 = sorted_cu[index_c_base + unit_max * 3] if index_c_base + unit_max * 3 < max_idx else sorted_cu[-1]
 
-        # 修正：使用与C++一致的系数
+        # 修正：使用与C++一致的系数（AdpIsotropic.cpp lines 332-345）
         for i in range(len(self.cu_ave)):
             if self.cu_ave[i] < li1:
-                self.cu_ave[i] = 2.0 * self.L_ave  # 修改：1.8 -> 2.0
+                self.cu_ave[i] = 1.8 * self.L_ave  # C++值: 1.8
             elif self.cu_ave[i] < li2:
-                self.cu_ave[i] = 1.5 * self.L_ave  # 修改：1.4 -> 1.5
+                self.cu_ave[i] = 1.4 * self.L_ave  # C++值: 1.4
             elif self.cu_ave[i] < li3:
-                self.cu_ave[i] = 1.0 * self.L_ave
+                self.cu_ave[i] = 1.0 * self.L_ave  # C++值: 1.0
             elif self.cu_ave[i] < li4:
-                self.cu_ave[i] = 0.8 * self.L_ave
+                self.cu_ave[i] = 0.8 * self.L_ave  # C++值: 0.8
             else:
-                self.cu_ave[i] = 0.6 * self.L_ave
+                self.cu_ave[i] = 0.6 * self.L_ave  # C++值: 0.6
 
     def split_edges(self, mode: str = "subremeshing", max_iter: int = 10) -> Tuple[List[Point], List[Triangle]]:
         if mode == "subremeshing":
@@ -292,16 +429,23 @@ class EdgeSplitter:
                     visited_edges.add((b1, b2))
                     edge_length = self._edge_length(points_out[b1], points_out[b2])
                     if edge_length > 2 * E_ave:
-                        # 修正1：正确计算插入点数量
+                        # 修正1：正确计算插入点数量 - 与C++一致
                         insert_num = int(edge_length / E_ave)  # 段数
-                        n = max(1, insert_num - 1)  # 插入点数 = 段数 - 1
+                        n = insert_num  # 插入点数 = 段数（与C++一致）
                         split_list.append((b1, b2, n))
 
             if not split_list:
                 break
 
+            # Track which edges have been split
+            split_edges = set()
+            for (bs1, bs2, n) in split_list:
+                split_edges.add((min(bs1, bs2), max(bs1, bs2)))
+
             points_end_idx = len(points_out)
             new_faces = []
+            processed_triangles = set()  # Track which triangles have been subdivided
+            
             for (bs1, bs2, n) in split_list:
                 if not all(self._is_valid_index(i, len(points_out)) for i in [bs1, bs2]):
                     continue
@@ -320,7 +464,12 @@ class EdgeSplitter:
                 triangle_vertices = [v for v in bs3_list if
                                      v != bs1 and v != bs2 and self._is_valid_index(v, len(points_out))]
 
+                # Mark triangles containing this split edge as processed
                 for tv in triangle_vertices:
+                    # Create a canonical representation of the triangle
+                    tri = tuple(sorted([bs1, bs2, tv]))
+                    processed_triangles.add(tri)
+                    
                     self._local_reconnection(
                         points_out, neighbor_out, faces_out, new_faces,
                         bs1, bs2, tv, new_point_indices, n, E_ave
@@ -330,10 +479,18 @@ class EdgeSplitter:
                     neighbor_out, bs1, bs2, new_point_indices, n
                 )
 
+            # Remove old faces that were subdivided
+            faces_to_keep = []
+            for face in faces_out:
+                tri = tuple(sorted(face))
+                if tri not in processed_triangles:
+                    faces_to_keep.append(face)
+            
+            faces_out = faces_to_keep
+            faces_out.extend(new_faces)
+
             for i in range(original_number, len(neighbor_out)):
                 neighbor_out[i] = self._structure_remove_repeat(neighbor_out[i])
-
-            faces_out.extend(new_faces)
 
         return points_out, faces_out
 
@@ -397,49 +554,23 @@ class EdgeSplitter:
                             faces: List[Triangle], new_faces: List[Triangle],
                             bs1: int, bs2: int, tv: int, new_points: List[int],
                             n: int, E_ave: float) -> None:
-        len12 = self._edge_length(points[bs1], points[bs2])
-        len13 = self._edge_length(points[bs1], points[tv])
-        len23 = self._edge_length(points[bs2], points[tv])
-
-        # 修正：完整实现三种情况
-        if len13 <= 2 * E_ave and len23 <= 2 * E_ave:
-            # 情况1：三条边都相对较短，在所有边上插入点
-            p13_points = self._insert_points_on_edge(points, bs1, tv, n)
-            p23_points = self._insert_points_on_edge(points, bs2, tv, n)
-            p13_indices = list(range(len(points), len(points) + n))
-            p23_indices = list(range(p13_indices[-1] + 1, p13_indices[-1] + 1 + n)) if n > 0 else []
-            points.extend(p13_points + p23_points)
-
-            # 创建均匀的四边形网格
-            for k in range(n):
-                if k >= len(new_points) or k >= len(p13_indices) or k >= len(p23_indices):
-                    continue
-                v1 = new_points[k]
-                v2 = p13_indices[k]
-                v3 = tv
-                v4 = p23_indices[k]
-                if all(self._is_valid_index(i, len(points)) for i in [v1, v2, v3, v4]):
-                    self._split_quadrilateral(neighbors, new_faces, v1, v2, v3, v4)
-        else:
-            # 情况2和3：根据边长和角度决定分割策略
-            edges = [(len12, bs1, bs2), (len13, bs1, tv), (len23, bs2, tv)]
-            edges.sort(reverse=True, key=lambda x: x[0])
-            (_, l1, l2), (_, s1, s2) = edges[:2]
-
-            long_points = self._insert_points_on_edge(points, l1, l2, n)
-            second_points = self._insert_points_on_edge(points, s1, s2, n)
-            long_indices = list(range(len(points), len(points) + n))
-            second_indices = list(range(long_indices[-1] + 1, long_indices[-1] + 1 + n)) if n > 0 else []
-            points.extend(long_points + second_points)
-
-            # 使用点配对算法
-            for k in range(n):
-                if k >= len(long_indices) or k >= len(second_indices):
-                    continue
-                v1 = long_indices[k]
-                v2 = second_indices[k]
-                if all(self._is_valid_index(i, len(points)) for i in [v1, v2, l1, s1]):
-                    self._split_quadrilateral(neighbors, new_faces, v1, v2, l1, s1)
+        """
+        Subdivide triangle (bs1, bs2, tv) where edge bs1-bs2 has been split with new points.
+        Creates new triangular faces connecting the split edge points to tv.
+        """
+        if n == 0 or len(new_points) == 0:
+            return
+        
+        # Create triangles connecting consecutive points on the split edge to tv
+        # Triangle: bs1 - new_points[0] - tv
+        new_faces.append([bs1, new_points[0], tv])
+        
+        # Intermediate triangles: new_points[i-1] - new_points[i] - tv
+        for i in range(1, len(new_points)):
+            new_faces.append([new_points[i-1], new_points[i], tv])
+        
+        # Final triangle: new_points[-1] - bs2 - tv
+        new_faces.append([new_points[-1], bs2, tv])
 
     def _insert_points_on_edge(self, points: List[Point], p1: int, p2: int, n: int) -> List[Point]:
         if not all(self._is_valid_index(i, len(points)) for i in [p1, p2]) or n <= 0:
