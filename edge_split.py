@@ -116,6 +116,8 @@ class MeshPartitioner:
         self.partitions = []
         self.border_vertices = set()  # Vertices on partition boundaries
         self.vertex_adjacency = None
+        self.boundary_edges = {}  # Maps (v1, v2) -> list of partition indices
+        self.boundary_edge_split_plan = {}  # Maps (v1, v2) -> split plan
 
     def build_vertex_adjacency(self) -> Dict[int, Set[int]]:
         """Build vertex-to-vertex adjacency information from faces."""
@@ -220,8 +222,49 @@ class MeshPartitioner:
 
         # Filter out empty partitions
         self.partitions = [p for p in partition_data if len(p['faces']) > 0]
+        
+        # Fifth pass: identify all boundary edges
+        self.identify_boundary_edges(vertex_partitions)
 
         return self.partitions
+
+    def identify_boundary_edges(self, vertex_partitions: np.ndarray) -> None:
+        """
+        Identify all boundary edges (edges shared by multiple partitions).
+        
+        Args:
+            vertex_partitions: Array mapping vertex index to partition index
+        """
+        # Build adjacency if not already built
+        if self.vertex_adjacency is None:
+            self.vertex_adjacency = self.build_vertex_adjacency()
+        
+        # For each edge in the mesh, check if its vertices belong to different partitions
+        edge_partitions = {}  # Maps (v1, v2) -> set of partition indices
+        
+        for face in self.faces:
+            v0, v1, v2 = face
+            edges = [(v0, v1), (v1, v2), (v2, v0)]
+            
+            for v_a, v_b in edges:
+                # Normalize edge representation (smaller index first)
+                edge = (min(v_a, v_b), max(v_a, v_b))
+                
+                # Get partitions for both vertices
+                part_a = vertex_partitions[v_a]
+                part_b = vertex_partitions[v_b]
+                
+                if edge not in edge_partitions:
+                    edge_partitions[edge] = set()
+                
+                # Add the partition(s) this edge belongs to
+                edge_partitions[edge].add(part_a)
+                edge_partitions[edge].add(part_b)
+        
+        # Identify boundary edges (belong to multiple partitions)
+        for edge, partitions in edge_partitions.items():
+            if len(partitions) > 1:
+                self.boundary_edges[edge] = sorted(list(partitions))
 
     def extract_submesh(self, partition: Dict) -> Tuple[List[Point], List[Triangle], Dict[int, int], Dict[int, int]]:
         """
@@ -577,8 +620,7 @@ class EdgeSplitter:
 
     def split_edges_with_partitioning(self, mode: str = "subremeshing", max_iter: int = 10) -> Tuple[List[Point], List[Triangle]]:
         """
-        Split edges using octree partitioning.
-        All edges are eligible for splitting, including those involving boundary vertices.
+        Split edges using octree partitioning with global coordination for boundary edges.
         
         Args:
             mode: Either "subremeshing" or "histogram"
@@ -597,6 +639,12 @@ class EdgeSplitter:
         partitions = partitioner.partition_octree()
         print(f"Created {len(partitions)} non-empty partitions")
         print(f"Global border vertices: {len(partitioner.border_vertices)}")
+        print(f"Global boundary edges: {len(partitioner.boundary_edges)}")
+        
+        # Step 1.5: Create global splitting plan for boundary edges
+        print("\n[Step 1.5] Creating global splitting plan for boundary edges...")
+        self._create_global_boundary_split_plan(partitioner, mode, max_iter)
+        print(f"  Planned splits for {len(partitioner.boundary_edge_split_plan)} boundary edges")
         
         # Step 2: Split edges in each partition
         print("\n[Step 2] Splitting edges in partitions...")
@@ -617,14 +665,14 @@ class EdgeSplitter:
             sub_splitter = EdgeSplitter(use_partitioning=False)
             sub_splitter.initialize(submesh_vertices, submesh_faces)
             
-            # Perform splitting on this partition
+            # Perform splitting on this partition with global coordination
             if mode == "subremeshing":
-                split_vertices, split_faces = self._split_partition_subremeshing(
-                    sub_splitter, local_border_vertices, max_iter
+                split_vertices, split_faces, split_metadata = self._split_partition_subremeshing(
+                    sub_splitter, local_border_vertices, max_iter, partitioner, vertex_map, reverse_map
                 )
             elif mode == "histogram":
-                split_vertices, split_faces = self._split_partition_histogram(
-                    sub_splitter, local_border_vertices, max_iter
+                split_vertices, split_faces, split_metadata = self._split_partition_histogram(
+                    sub_splitter, local_border_vertices, max_iter, partitioner, vertex_map, reverse_map
                 )
             else:
                 raise ValueError("模式必须是 'subremeshing' 或 'histogram'")
@@ -638,12 +686,13 @@ class EdgeSplitter:
                 'vertex_map': vertex_map,
                 'reverse_map': reverse_map,
                 'core_vertices': partition['core_vertices'],
-                'original_submesh_vertices': submesh_vertices
+                'original_submesh_vertices': submesh_vertices,
+                'split_metadata': split_metadata  # Metadata for topological merging
             })
         
-        # Step 3: Merge split submeshes
+        # Step 3: Merge split submeshes with topological matching
         print("\n[Step 3] Merging split submeshes...")
-        final_vertices, final_faces = self._merge_split_submeshes(split_submeshes)
+        final_vertices, final_faces = self._merge_split_submeshes_topological(split_submeshes, partitioner)
         
         print(f"\n=== Edge Splitting Complete ===")
         print(f"Output mesh: {len(final_vertices)} vertices, {len(final_faces)} faces")
@@ -652,24 +701,81 @@ class EdgeSplitter:
         
         return final_vertices, final_faces
 
+    def _create_global_boundary_split_plan(self, partitioner: MeshPartitioner, mode: str, max_iter: int) -> None:
+        """
+        Create a unified splitting plan for all boundary edges.
+        
+        Args:
+            partitioner: The mesh partitioner with boundary edge information
+            mode: Splitting mode ("subremeshing" or "histogram")
+            max_iter: Maximum iterations
+        """
+        # For each boundary edge, determine how it should be split
+        for edge, _ in partitioner.boundary_edges.items():
+            v1, v2 = edge
+            p1 = self.points[v1]
+            p2 = self.points[v2]
+            edge_length = self._edge_length(p1, p2)
+            
+            if mode == "subremeshing":
+                # Use average edge length criterion
+                E_ave = self.L_ave
+                if edge_length > 2 * E_ave:
+                    insert_num = int(edge_length / E_ave)
+                    n = insert_num
+                    # Calculate split positions
+                    split_positions = []
+                    segment = [(p2[i] - p1[i]) / (n + 1) for i in range(3)]
+                    for k in range(1, n + 1):
+                        pos = [p1[i] + segment[i] * k for i in range(3)]
+                        split_positions.append(pos)
+                    
+                    partitioner.boundary_edge_split_plan[edge] = {
+                        'num_splits': n,
+                        'positions': split_positions
+                    }
+            
+            elif mode == "histogram":
+                # Use curvature-based criterion if available
+                if self.cu_ave and v1 < len(self.cu_ave) and v2 < len(self.cu_ave):
+                    m_a = self.cu_ave[v1]
+                    m_b = self.cu_ave[v2]
+                    threshold = 1.25 * min(m_a, m_b)
+                    
+                    if edge_length >= threshold:
+                        # Split at midpoint for histogram mode
+                        mid_point = [(p1[i] + p2[i]) / 2 for i in range(3)]
+                        partitioner.boundary_edge_split_plan[edge] = {
+                            'num_splits': 1,
+                            'positions': [mid_point]
+                        }
+
     def _split_partition_subremeshing(self, sub_splitter: 'EdgeSplitter', 
                                      border_vertices: Set[int], 
-                                     max_iterations: int) -> Tuple[List[Point], List[Triangle]]:
+                                     max_iterations: int,
+                                     partitioner: MeshPartitioner,
+                                     vertex_map: Dict[int, int],
+                                     reverse_map: Dict[int, int]) -> Tuple[List[Point], List[Triangle], Dict]:
         """
-        Split edges in a partition using subremeshing mode.
-        Edges can be split regardless of whether vertices are border vertices.
+        Split edges in a partition using subremeshing mode with global coordination.
+        
+        Returns:
+            Tuple of (vertices, faces, metadata) where metadata tracks split point origins
         """
         points_out = [p[:] for p in sub_splitter.points]
         neighbor_out = [n[:] for n in sub_splitter.point_neighbor]
         faces_out = [f[:] for f in sub_splitter.faces]
         original_number = len(points_out)
+        
+        # Metadata to track which vertices came from which global edge
+        split_metadata = {}  # Maps local vertex index -> (global_edge, split_index)
 
         for it in range(max_iterations):
             E_ave = sub_splitter._compute_average_edge_length()
             if E_ave <= 0:
                 break
 
-            split_list: List[Tuple[int, int, int]] = []
+            split_list: List[Tuple[int, int, int, List[Point]]] = []
             visited_edges = set()
             
             for i in range(len(neighbor_out)):
@@ -685,37 +791,63 @@ class EdgeSplitter:
                         continue
                         
                     visited_edges.add((b1, b2))
+                    
+                    # Check if this is a boundary edge (in global coordinates)
+                    if b1 < original_number and b2 < original_number:
+                        global_v1 = reverse_map.get(b1)
+                        global_v2 = reverse_map.get(b2)
+                        
+                        if global_v1 is not None and global_v2 is not None:
+                            global_edge = (min(global_v1, global_v2), max(global_v1, global_v2))
+                            
+                            # Use global plan if this is a boundary edge
+                            if global_edge in partitioner.boundary_edge_split_plan:
+                                plan = partitioner.boundary_edge_split_plan[global_edge]
+                                n = plan['num_splits']
+                                new_points = plan['positions']
+                                split_list.append((b1, b2, n, new_points, global_edge))
+                                continue
+                    
+                    # For non-boundary edges, use local criterion
                     edge_length = sub_splitter._edge_length(points_out[b1], points_out[b2])
                     if edge_length > 2 * E_ave:
                         insert_num = int(edge_length / E_ave)
                         n = insert_num
-                        split_list.append((b1, b2, n))
+                        p1, p2 = points_out[b1], points_out[b2]
+                        segment = [(p2[0] - p1[0]) / (n + 1), (p2[1] - p1[1]) / (n + 1), (p2[2] - p1[2]) / (n + 1)]
+                        new_points = [
+                            [p1[0] + segment[0] * k, p1[1] + segment[1] * k, p1[2] + segment[2] * k]
+                            for k in range(1, n + 1)
+                        ]
+                        split_list.append((b1, b2, n, new_points, None))
 
             if not split_list:
                 break
-
-            # Track which edges have been split
-            split_edges = set()
-            for (bs1, bs2, n) in split_list:
-                split_edges.add((min(bs1, bs2), max(bs1, bs2)))
 
             points_end_idx = len(points_out)
             new_faces = []
             processed_triangles = set()
             
-            for (bs1, bs2, n) in split_list:
+            for split_info in split_list:
+                if len(split_info) == 5:
+                    bs1, bs2, n, new_points, global_edge = split_info
+                else:
+                    bs1, bs2, n, new_points = split_info
+                    global_edge = None
+                    
                 if not all(sub_splitter._is_valid_index(i, len(points_out)) for i in [bs1, bs2]):
                     continue
 
-                p1, p2 = points_out[bs1], points_out[bs2]
-                segment = [(p2[0] - p1[0]) / (n + 1), (p2[1] - p1[1]) / (n + 1), (p2[2] - p1[2]) / (n + 1)]
-                new_points = [
-                    [p1[0] + segment[0] * k, p1[1] + segment[1] * k, p1[2] + segment[2] * k]
-                    for k in range(1, n + 1)
-                ]
-                points_out.extend(new_points)
-                new_point_indices = list(range(points_end_idx, points_end_idx + n))
-                points_end_idx += n
+                # Add new points and track metadata
+                new_point_indices = []
+                for k, point in enumerate(new_points):
+                    new_idx = len(points_out)
+                    points_out.append(point)
+                    new_point_indices.append(new_idx)
+                    
+                    # Track metadata for boundary edge splits
+                    if global_edge is not None:
+                        split_metadata[new_idx] = (global_edge, k)
 
                 bs3_list = sub_splitter._collect_bs3_list(neighbor_out[bs1], bs1, bs2)
                 triangle_vertices = [v for v in bs3_list if
@@ -747,14 +879,19 @@ class EdgeSplitter:
             for i in range(original_number, len(neighbor_out)):
                 neighbor_out[i] = sub_splitter._structure_remove_repeat(neighbor_out[i])
 
-        return points_out, faces_out
+        return points_out, faces_out, split_metadata
 
     def _split_partition_histogram(self, sub_splitter: 'EdgeSplitter',
                                    border_vertices: Set[int],
-                                   max_iterations: int) -> Tuple[List[Point], List[Triangle]]:
+                                   max_iterations: int,
+                                   partitioner: MeshPartitioner,
+                                   vertex_map: Dict[int, int],
+                                   reverse_map: Dict[int, int]) -> Tuple[List[Point], List[Triangle], Dict]:
         """
-        Split edges in a partition using histogram mode.
-        Edges can be split regardless of whether vertices are border vertices.
+        Split edges in a partition using histogram mode with global coordination.
+        
+        Returns:
+            Tuple of (vertices, faces, metadata) where metadata tracks split point origins
         """
         # Initialize histogram factors for the submesh
         sub_splitter._init_histogram_factors()
@@ -766,6 +903,9 @@ class EdgeSplitter:
 
         if not sub_splitter.cu_ave or len(sub_splitter.cu_ave) != original_number:
             raise ValueError("cu_ave初始化失败或长度不匹配顶点数量")
+
+        # Metadata to track which vertices came from which global edge
+        split_metadata = {}  # Maps local vertex index -> (global_edge, split_index)
 
         for it in range(max_iterations):
             split_list = []
@@ -790,6 +930,32 @@ class EdgeSplitter:
                             not sub_splitter._is_valid_index(b2, original_number)):
                         continue
                     visited_edges.add((b1, b2))
+                    
+                    # Check if this is a boundary edge (in global coordinates)
+                    global_edge = None
+                    mid_point = None
+                    
+                    global_v1 = reverse_map.get(b1)
+                    global_v2 = reverse_map.get(b2)
+                    
+                    if global_v1 is not None and global_v2 is not None:
+                        global_edge = (min(global_v1, global_v2), max(global_v1, global_v2))
+                        
+                        # Use global plan if this is a boundary edge
+                        if global_edge in partitioner.boundary_edge_split_plan:
+                            plan = partitioner.boundary_edge_split_plan[global_edge]
+                            if plan['num_splits'] > 0:
+                                mid_point = plan['positions'][0]  # Histogram uses midpoint
+                                split_list.append((b1, b2, mid_point, global_edge))
+                                for nb in sub_splitter._unique_neighbors(b1):
+                                    if sub_splitter._is_valid_index(nb, len(point_judge)):
+                                        point_judge[nb] = False
+                                for nb in sub_splitter._unique_neighbors(b2):
+                                    if sub_splitter._is_valid_index(nb, len(point_judge)):
+                                        point_judge[nb] = False
+                            continue
+                    
+                    # For non-boundary edges, use local criterion
                     length12 = sub_splitter._edge_length(points_out[b1], points_out[b2])
                     if b1 >= len(sub_splitter.cu_ave) or b2 >= len(sub_splitter.cu_ave):
                         continue
@@ -798,7 +964,12 @@ class EdgeSplitter:
                     threshold = 1.25 * min(m_a, m_b)
 
                     if length12 >= threshold:
-                        split_list.append((b1, b2))
+                        mid_point = [
+                            (points_out[b1][0] + points_out[b2][0]) / 2,
+                            (points_out[b1][1] + points_out[b2][1]) / 2,
+                            (points_out[b1][2] + points_out[b2][2]) / 2
+                        ]
+                        split_list.append((b1, b2, mid_point, None))
                         for nb in sub_splitter._unique_neighbors(b1):
                             if sub_splitter._is_valid_index(nb, len(point_judge)):
                                 point_judge[nb] = False
@@ -810,17 +981,18 @@ class EdgeSplitter:
                 break
 
             new_faces = []
-            for (bs1, bs2) in split_list:
+            for split_info in split_list:
+                bs1, bs2, mid_point, global_edge = split_info
+                
                 if not all(sub_splitter._is_valid_index(i, len(points_out)) for i in [bs1, bs2]):
                     continue
 
-                mid_point = [
-                    (points_out[bs1][0] + points_out[bs2][0]) / 2,
-                    (points_out[bs1][1] + points_out[bs2][1]) / 2,
-                    (points_out[bs1][2] + points_out[bs2][2]) / 2
-                ]
                 mid_idx = len(points_out)
                 points_out.append(mid_point)
+                
+                # Track metadata for boundary edge splits
+                if global_edge is not None:
+                    split_metadata[mid_idx] = (global_edge, 0)
 
                 bs3_list = sub_splitter._collect_bs3_list(neighbor_out[bs1], bs1, bs2)
                 triangle_vertices = [v for v in bs3_list if
@@ -841,7 +1013,7 @@ class EdgeSplitter:
 
             faces_out.extend(new_faces)
 
-        return points_out, faces_out
+        return points_out, faces_out, split_metadata
 
     def _merge_split_submeshes(self, submeshes: List[Dict]) -> Tuple[List[Point], List[Triangle]]:
         """
@@ -937,6 +1109,119 @@ class EdgeSplitter:
                 unique_faces.append(face)
 
         print(f"Merged {len(submeshes)} submeshes:")
+        print(f"  Unique vertices: {len(merged_vertices)}")
+        print(f"  Unique faces: {len(unique_faces)}")
+
+        return merged_vertices, unique_faces
+
+    def _merge_split_submeshes_topological(self, submeshes: List[Dict], partitioner: MeshPartitioner) -> Tuple[List[Point], List[Triangle]]:
+        """
+        Merge split submeshes using topological matching for boundary vertices.
+        
+        Args:
+            submeshes: List of dictionaries containing split submesh data with metadata
+            partitioner: The mesh partitioner with boundary edge information
+            
+        Returns:
+            Tuple of (merged_vertices, merged_faces)
+        """
+        merged_vertices = []
+        merged_faces = []
+        global_vertex_map = {}  # Maps (submesh_idx, local_idx) -> merged_idx
+        vertex_global_to_merged = {}  # Maps original global vertex idx to merged idx
+        
+        # Maps (global_edge, split_index) -> merged_idx for boundary split points
+        boundary_split_map = {}
+        
+        tolerance = 1e-6
+
+        # First pass: collect all faces and determine which vertices are used
+        temp_faces = []
+        used_vertices = set()
+
+        for submesh_idx, submesh in enumerate(submeshes):
+            faces = submesh['faces']
+            for face in faces:
+                temp_faces.append((submesh_idx, face))
+                for v in face:
+                    used_vertices.add((submesh_idx, v))
+
+        # Second pass: process only used vertices
+        for submesh_idx, submesh in enumerate(submeshes):
+            vertices = submesh['vertices']
+            reverse_map = submesh['reverse_map']
+            original_submesh_vertices = submesh['original_submesh_vertices']
+            split_metadata = submesh.get('split_metadata', {})
+
+            for local_idx in range(len(vertices)):
+                if (submesh_idx, local_idx) not in used_vertices:
+                    continue
+
+                vertex = vertices[local_idx]
+                
+                # Check if this is a boundary split point with metadata
+                if local_idx in split_metadata:
+                    global_edge, split_index = split_metadata[local_idx]
+                    boundary_key = (global_edge, split_index)
+                    
+                    if boundary_key in boundary_split_map:
+                        # This boundary split point already exists
+                        merged_idx = boundary_split_map[boundary_key]
+                    else:
+                        # New boundary split point
+                        merged_idx = len(merged_vertices)
+                        merged_vertices.append(vertex)
+                        boundary_split_map[boundary_key] = merged_idx
+                    
+                    global_vertex_map[(submesh_idx, local_idx)] = merged_idx
+                    continue
+                
+                # Check if this is an original vertex
+                original_global_idx = None
+                if local_idx < len(original_submesh_vertices):
+                    # Try to match to original vertex by position
+                    min_dist = float('inf')
+                    for orig_local_idx, orig_global_idx in reverse_map.items():
+                        if orig_local_idx < len(original_submesh_vertices):
+                            orig_vert = original_submesh_vertices[orig_local_idx]
+                            dist = math.sqrt(sum((vertex[i] - orig_vert[i]) ** 2 for i in range(3)))
+                            if dist < min_dist:
+                                min_dist = dist
+                                if dist < 1e-5:
+                                    original_global_idx = orig_global_idx
+                                    break
+
+                # Check if this vertex was already added from another partition
+                if original_global_idx is not None and original_global_idx in vertex_global_to_merged:
+                    merged_idx = vertex_global_to_merged[original_global_idx]
+                else:
+                    # New vertex (either original or non-boundary split)
+                    merged_idx = len(merged_vertices)
+                    merged_vertices.append(vertex)
+
+                    if original_global_idx is not None:
+                        vertex_global_to_merged[original_global_idx] = merged_idx
+
+                global_vertex_map[(submesh_idx, local_idx)] = merged_idx
+
+        # Third pass: process faces
+        for submesh_idx, face in temp_faces:
+            merged_face = [global_vertex_map[(submesh_idx, v)] for v in face]
+            # Check for degenerate faces
+            if len(set(merged_face)) == 3:
+                merged_faces.append(merged_face)
+
+        # Remove duplicate faces
+        unique_faces = []
+        seen_faces = set()
+        for face in merged_faces:
+            face_tuple = tuple(sorted(face))
+            if face_tuple not in seen_faces:
+                seen_faces.add(face_tuple)
+                unique_faces.append(face)
+
+        print(f"Merged {len(submeshes)} submeshes with topological matching:")
+        print(f"  Boundary split points matched: {len(boundary_split_map)}")
         print(f"  Unique vertices: {len(merged_vertices)}")
         print(f"  Unique faces: {len(unique_faces)}")
 
