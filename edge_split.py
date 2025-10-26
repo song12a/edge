@@ -578,7 +578,7 @@ class EdgeSplitter:
     def split_edges_with_partitioning(self, mode: str = "subremeshing", max_iter: int = 10) -> Tuple[List[Point], List[Triangle]]:
         """
         Split edges using octree partitioning.
-        Only interior vertices (non-border) in each partition will be split.
+        All edges are eligible for splitting, including those involving boundary vertices.
         
         Args:
             mode: Either "subremeshing" or "histogram"
@@ -657,7 +657,7 @@ class EdgeSplitter:
                                      max_iterations: int) -> Tuple[List[Point], List[Triangle]]:
         """
         Split edges in a partition using subremeshing mode.
-        Border vertices are excluded from splitting.
+        Edges can be split regardless of whether vertices are border vertices.
         """
         points_out = [p[:] for p in sub_splitter.points]
         neighbor_out = [n[:] for n in sub_splitter.point_neighbor]
@@ -674,17 +674,14 @@ class EdgeSplitter:
             
             for i in range(len(neighbor_out)):
                 b1 = i
-                # Skip border vertices
-                if b1 in border_vertices:
-                    continue
                     
                 for j in range(0, len(neighbor_out[i]), 2):
                     if j + 1 >= len(neighbor_out[i]):
                         continue
                     b2 = neighbor_out[i][j]
                     
-                    # Skip if b2 is a border vertex or edge already visited
-                    if b2 in border_vertices or b1 >= b2 or (b1, b2) in visited_edges:
+                    # Skip if edge already visited
+                    if b1 >= b2 or (b1, b2) in visited_edges:
                         continue
                         
                     visited_edges.add((b1, b2))
@@ -757,7 +754,7 @@ class EdgeSplitter:
                                    max_iterations: int) -> Tuple[List[Point], List[Triangle]]:
         """
         Split edges in a partition using histogram mode.
-        Border vertices are excluded from splitting.
+        Edges can be split regardless of whether vertices are border vertices.
         """
         # Initialize histogram factors for the submesh
         sub_splitter._init_histogram_factors()
@@ -777,9 +774,6 @@ class EdgeSplitter:
 
             for i in range(len(neighbor_out)):
                 b1 = i
-                # Skip border vertices
-                if b1 in border_vertices:
-                    continue
                     
                 if not point_judge[b1]:
                     continue
@@ -790,10 +784,6 @@ class EdgeSplitter:
                     if j + 1 >= len(neighbor_out[i]):
                         continue
                     b2 = neighbor_out[i][j]
-                    
-                    # Skip if b2 is a border vertex
-                    if b2 in border_vertices:
-                        continue
                         
                     if (b1 >= b2 or not point_judge[b2] or
                             (b1, b2) in visited_edges or

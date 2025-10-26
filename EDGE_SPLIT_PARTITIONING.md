@@ -13,12 +13,13 @@ The mesh is divided into 8 spatial partitions (octree) with 2-ring neighborhood 
 - **Extended vertices**: Core vertices plus their 2-ring neighborhood
 - **Border vertices**: Vertices on partition boundaries (preserved during splitting)
 
-### 2. Boundary Vertex Preservation
-Interior vertices only are modified during edge splitting:
+### 2. Edge Splitting with Partitioning
+All edges can be split during edge splitting operations:
 
-- **Border vertices** (vertices on partition boundaries) are **not** split
-- Only **interior vertices** (non-border vertices within each partition) undergo edge splitting
-- This ensures mesh coherence when partitions are merged
+- Edges where both vertices are interior vertices
+- Edges where one vertex is a border vertex and one is interior
+- Edges where both vertices are border vertices
+- This allows for more aggressive splitting while maintaining partition structure
 
 ### 3. Two Splitting Modes Preserved
 Both original splitting modes are supported with and without partitioning:
@@ -180,24 +181,26 @@ for v in partition['vertices']:
         partition['is_border'].add(v)  # Inter-partition boundary
 ```
 
-### Edge Splitting with Boundary Exclusion
+### Edge Splitting in Partitions
 
-When splitting edges, border vertices are skipped:
+When splitting edges, all edges are eligible for splitting:
 
 ```python
 for i in range(len(neighbor_out)):
     b1 = i
-    if b1 in border_vertices:  # Skip border vertices
-        continue
     
     for j in range(0, len(neighbor_out[i]), 2):
         b2 = neighbor_out[i][j]
-        if b2 in border_vertices:  # Skip edges to border vertices
-            continue
+        # All edges are processed, including those with border vertices
         
         # Process edge (b1, b2) for splitting
         ...
 ```
+
+This allows for:
+- Splitting edges between two interior vertices
+- Splitting edges between one border vertex and one interior vertex  
+- Splitting edges between two border vertices
 
 ### Partition Merging
 
@@ -224,19 +227,20 @@ if vertex_key in vertex_position_map:
 
 **Use partitioning (`use_partitioning=True`) when:**
 - Processing large meshes (> 100K vertices)
-- Want to preserve mesh boundaries
-- Need finer control over which vertices are modified
+- Want to split mesh in independent spatial regions
+- Need parallel processing capabilities (future enhancement)
 
 **Use original mode (`use_partitioning=False`) when:**
 - Processing small meshes (< 10K vertices)
-- Want maximum splitting aggressiveness
-- Don't need boundary preservation
+- Want maximum splitting aggressiveness on entire mesh
+- Simpler workflow without partitioning overhead
 
 ### Partition Size Impact
 
 With octree partitioning (8 partitions):
-- Small meshes may have most vertices as border vertices → less splitting
-- Large meshes have better core/border ratio → more effective splitting
+- Mesh is divided into 8 spatial octants
+- Each partition includes 2-ring neighborhoods for context
+- All edges within each partition are eligible for splitting
 
 ## Backward Compatibility
 

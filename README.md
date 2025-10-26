@@ -42,11 +42,11 @@ This satisfies the requirements of the Minimal Simplification Domain (MDD) as de
 The edge splitting implementation supports two operational modes:
 
 - **Without Partitioning**: Original behavior, splits edges across the entire mesh
-- **With Octree Partitioning**: Divides mesh into 8 spatial partitions, only splits interior vertices
+- **With Octree Partitioning**: Divides mesh into 8 spatial partitions, processes each independently
 
 **Key features:**
 - Octree-based dynamic partitioning
-- Boundary vertex preservation (border vertices are not split)
+- All edges eligible for splitting (including those with boundary vertices)
 - Two splitting modes: Subremeshing and Histogram
 - Full backward compatibility with original behavior
 

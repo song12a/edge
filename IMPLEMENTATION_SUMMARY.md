@@ -5,7 +5,7 @@
 ### Requirements (from Problem Statement - Chinese)
 问题陈述要求：
 1. **修改分区逻辑**: 从整个网格分裂改为按照mesh_simplification_mdd_lme.py中的八叉树动态分区对网格进行分区，然后每个分区单独进行分裂
-2. **排除边界顶点**: 只对网格的内部节点执行分裂，不考虑边界顶点
+2. **修改边界处理**: 允许分裂包含边界顶点的边，包括一个顶点是边界顶点、一个顶点是内部顶点的边，以及两个顶点都是边界顶点的边
 3. **保留两个模式**: 保留Subremeshing模式和Histogram模式
 
 ### Implementation Status: ✅ COMPLETE
@@ -18,10 +18,12 @@ All three requirements have been fully implemented:
 - Includes 2-ring neighborhood support for topological context
 - Each partition is processed independently
 
-✅ **2. Boundary Vertex Preservation**
-- Border vertices are identified at partition boundaries
-- Only interior (non-border) vertices undergo edge splitting
-- Ensures mesh coherence when partitions are merged
+✅ **2. Edge Splitting with Boundary Vertices**
+- All edges are eligible for splitting
+- Edges between two interior vertices can be split
+- Edges between one boundary vertex and one interior vertex can be split
+- Edges between two boundary vertices can be split
+- Ensures more aggressive splitting while maintaining partition structure
 
 ✅ **3. Dual Splitting Modes**
 - Both Subremeshing and Histogram modes are preserved
