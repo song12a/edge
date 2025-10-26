@@ -18,6 +18,15 @@ from edge_split import EdgeSplitter
 class CombinedMeshProcessor:
     """
     A unified processor for mesh partitioning, simplification, and edge splitting.
+    
+    This class uses octree-based partitioning with 2-ring neighborhood support
+    (following the approach from mesh_simplification_mdd_lme.py) to ensure both
+    simplification and edge splitting operations work on properly extended partitions.
+    
+    The 2-ring neighborhoods are essential because:
+    - For simplification: Provides topological context for QEM calculations
+    - For edge splitting: Ensures consistent edge splitting across partition boundaries
+    - For both: Maintains mesh quality at partition interfaces
     """
     
     def __init__(self, target_edges_per_partition: int = 200):
@@ -77,7 +86,8 @@ class CombinedMeshProcessor:
     def partition_mesh(self, vertices: np.ndarray, faces: np.ndarray, 
                       num_partitions: int = None) -> Tuple[MeshPartitioner, List[Dict]]:
         """
-        Partition a mesh using octree spatial subdivision.
+        Partition a mesh using octree spatial subdivision with 2-ring neighborhood support.
+        Uses the partitioning approach from mesh_simplification_mdd_lme.py.
         
         Args:
             vertices: Vertex array (N x 3)
@@ -85,23 +95,32 @@ class CombinedMeshProcessor:
             num_partitions: Number of partitions (if None, calculated from edge count)
             
         Returns:
-            Tuple of (partitioner, partitions)
+            Tuple of (partitioner, partitions) where partitions include 2-ring neighborhoods
         """
         if num_partitions is None:
             num_edges = self.count_edges(faces)
             num_partitions = self.calculate_num_partitions(num_edges)
         
-        print(f"\n=== Partitioning Mesh ===")
+        print(f"\n=== Partitioning Mesh with 2-Ring Neighborhoods ===")
         print(f"Vertices: {len(vertices)}, Faces: {len(faces)}")
         print(f"Edges: {self.count_edges(faces)}")
         print(f"Target edges per partition: {self.target_edges_per_partition}")
-        print(f"Using {num_partitions} partitions")
+        print(f"Using {num_partitions} partitions (octree subdivision)")
         
+        # Use MeshPartitioner from mesh_simplification_mdd_lme.py
+        # This automatically includes 2-ring neighborhood computation
         partitioner = MeshPartitioner(vertices, faces, num_partitions)
         partitions = partitioner.partition_octree()
         
         print(f"Created {len(partitions)} non-empty partitions")
         print(f"Border vertices: {len(partitioner.border_vertices)}")
+        
+        # Print 2-ring neighborhood statistics
+        for i, partition in enumerate(partitions):
+            core_count = len(partition['core_vertices'])
+            total_count = len(partition['vertices'])
+            ring_count = total_count - core_count
+            print(f"  Partition {i}: {core_count} core + {ring_count} 2-ring = {total_count} total vertices")
         
         return partitioner, partitions
     
@@ -130,14 +149,18 @@ class CombinedMeshProcessor:
                         mode: str = "histogram", max_iter: int = 3,
                         use_partitioning: bool = True, num_partitions: int = None) -> Tuple[List, List]:
         """
-        Split edges in a mesh.
+        Split edges in a mesh using the same 2-ring neighborhood partitioning as simplification.
+        
+        When use_partitioning=True, this method uses octree partitioning with 2-ring neighborhoods
+        (same approach as mesh_simplification_mdd_lme.py) to ensure edge splitting works on
+        properly extended partitions.
         
         Args:
             vertices: Input mesh vertices (list of [x, y, z])
             faces: Input mesh faces (list of [v1, v2, v3])
             mode: Splitting mode ("subremeshing" or "histogram")
             max_iter: Maximum iterations
-            use_partitioning: Whether to use octree partitioning
+            use_partitioning: Whether to use octree partitioning with 2-ring neighborhoods
             num_partitions: Number of partitions (if None, calculated from edge count)
             
         Returns:
@@ -151,8 +174,11 @@ class CombinedMeshProcessor:
         
         print(f"\n=== Splitting Edges ===")
         if use_partitioning:
-            print(f"Using partitioning with {num_partitions} partitions")
+            print(f"Using octree partitioning with 2-ring neighborhoods ({num_partitions} partitions)")
+            print(f"Note: EdgeSplitter internally uses the same partitioning approach as mesh_simplification_mdd_lme.py")
         
+        # EdgeSplitter has its own MeshPartitioner that includes 2-ring neighborhood support
+        # This is consistent with mesh_simplification_mdd_lme.py's approach
         splitter = EdgeSplitter(use_partitioning=use_partitioning, 
                                num_partitions=num_partitions if use_partitioning else 8)
         splitter.initialize(vertices, faces)
@@ -268,6 +294,9 @@ class CombinedMeshProcessor:
 def main():
     """
     Main function demonstrating usage of the combined mesh processor.
+    
+    This demonstrates partitioning with 2-ring neighborhoods (following mesh_simplification_mdd_lme.py)
+    and applying both simplification and edge splitting to the partitioned mesh.
     """
     # Configuration
     input_folder = "demo/data"
@@ -295,8 +324,10 @@ def main():
     # Process all meshes in the input directory
     print("\n" + "="*80)
     print("Combined Mesh Processing Tool")
+    print("Using mesh_simplification_mdd_lme.py partitioning approach")
     print("="*80)
     print(f"Target edges per partition: {target_edges_per_partition}")
+    print(f"Partitioning: Octree with 2-ring neighborhoods")
     print(f"Input directory: {input_folder}")
     print(f"Output directory: {output_folder}")
     
