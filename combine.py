@@ -2,13 +2,15 @@
 Combine module for mesh processing with octree partitioning.
 
 This module provides functionality to:
-1. Partition meshes using octree-based spatial subdivision
+1. Partition meshes using octree-based spatial subdivision with dynamic depth
 2. Apply mesh simplification (from mesh_simplification_mdd_lme.py)
 3. Apply edge splitting (from edge_split.py)
+4. Support iterative operations with dynamic 2-ring neighborhood recalculation
 """
 
 import numpy as np
 import os
+import math
 from typing import List, Tuple, Dict, Set
 from QEM import PLYReader, PLYWriter
 from mesh_simplification_mdd_lme import simplify_mesh_with_partitioning, MeshPartitioner
@@ -22,6 +24,9 @@ class CombinedMeshProcessor:
     This class uses octree-based partitioning with 2-ring neighborhood support
     (following the approach from mesh_simplification_mdd_lme.py) to ensure both
     simplification and edge splitting operations work on properly extended partitions.
+    
+    Features dynamic depth calculation based on edge count and iterative processing
+    with 2-ring neighborhood recalculation (similar to IterativeSimplifier).
     
     The 2-ring neighborhoods are essential because:
     - For simplification: Provides topological context for QEM calculations
@@ -38,32 +43,40 @@ class CombinedMeshProcessor:
         """
         self.target_edges_per_partition = target_edges_per_partition
         
-    def calculate_num_partitions(self, num_edges: int) -> int:
+    def calculate_octree_depth(self, num_edges: int) -> int:
         """
-        Calculate optimal number of partitions based on edge count.
+        Calculate octree depth based on edge count (following mesh_simplication_mdd_lme_new.py).
+        
+        Uses the formula: depth = max(1, int(math.ceil(math.log(total_edges / target_edges_per_partition, 8))))
         
         Args:
             num_edges: Total number of edges in the mesh
             
         Returns:
-            Number of partitions (always power of 2 for octree: 1, 8, 64, etc.)
+            Octree depth (1, 2, 3, etc.) which gives 8^depth partitions
         """
         if num_edges <= self.target_edges_per_partition:
             return 1
         
-        # Calculate how many partitions we need
-        needed_partitions = num_edges / self.target_edges_per_partition
+        # Dynamic depth calculation based on edge count
+        # This gives us 8^depth partitions (8, 64, 512, etc.)
+        depth = max(1, int(math.ceil(math.log(num_edges / self.target_edges_per_partition, 8))))
         
-        # Round to nearest power of 8 (for octree: 1, 8, 64, 512, etc.)
-        # Actually, octree subdivision gives us 8^n partitions
-        if needed_partitions <= 1:
-            return 1
-        elif needed_partitions <= 8:
-            return 8
-        elif needed_partitions <= 64:
-            return 64
-        else:
-            return 512
+        return depth
+        
+    def calculate_num_partitions(self, num_edges: int) -> int:
+        """
+        Calculate optimal number of partitions based on edge count.
+        Uses dynamic depth calculation: 8^depth partitions.
+        
+        Args:
+            num_edges: Total number of edges in the mesh
+            
+        Returns:
+            Number of partitions (8^depth: 1, 8, 64, 512, etc.)
+        """
+        depth = self.calculate_octree_depth(num_edges)
+        return 8 ** depth
     
     def count_edges(self, faces: np.ndarray) -> int:
         """
@@ -87,25 +100,30 @@ class CombinedMeshProcessor:
                       num_partitions: int = None) -> Tuple[MeshPartitioner, List[Dict]]:
         """
         Partition a mesh using octree spatial subdivision with 2-ring neighborhood support.
-        Uses the partitioning approach from mesh_simplification_mdd_lme.py.
+        Uses dynamic depth calculation based on edge count (following mesh_simplication_mdd_lme_new.py).
         
         Args:
             vertices: Vertex array (N x 3)
             faces: Face array (M x 3)
-            num_partitions: Number of partitions (if None, calculated from edge count)
+            num_partitions: Number of partitions (if None, calculated dynamically from edge count)
             
         Returns:
             Tuple of (partitioner, partitions) where partitions include 2-ring neighborhoods
         """
+        num_edges = self.count_edges(faces)
+        
         if num_partitions is None:
-            num_edges = self.count_edges(faces)
-            num_partitions = self.calculate_num_partitions(num_edges)
+            depth = self.calculate_octree_depth(num_edges)
+            num_partitions = 8 ** depth
+        else:
+            # Calculate depth from provided num_partitions
+            depth = int(math.log(num_partitions, 8)) if num_partitions > 1 else 1
         
         print(f"\n=== Partitioning Mesh with 2-Ring Neighborhoods ===")
         print(f"Vertices: {len(vertices)}, Faces: {len(faces)}")
-        print(f"Edges: {self.count_edges(faces)}")
+        print(f"Total edges: {num_edges}")
         print(f"Target edges per partition: {self.target_edges_per_partition}")
-        print(f"Using {num_partitions} partitions (octree subdivision)")
+        print(f"Using octree depth: {depth} (8^{depth} = {num_partitions} partitions)")
         
         # Use MeshPartitioner from mesh_simplification_mdd_lme.py
         # This automatically includes 2-ring neighborhood computation
@@ -184,6 +202,68 @@ class CombinedMeshProcessor:
         splitter.initialize(vertices, faces)
         return splitter.split_edges(mode=mode, max_iter=max_iter)
     
+    def split_edges_iterative(self, vertices: List, faces: List,
+                              mode: str = "histogram", max_iter: int = 3,
+                              use_partitioning: bool = True) -> Tuple[List, List]:
+        """
+        Split edges iteratively with dynamic partition and 2-ring neighborhood recalculation.
+        
+        Similar to IterativeSimplifier, this method:
+        1. Partitions the mesh based on current edge count
+        2. Performs one iteration of edge splitting
+        3. Recalculates partitions and 2-ring neighborhoods for next iteration
+        4. Repeats until max_iter is reached
+        
+        This ensures that the mesh is dynamically adapted after each split operation,
+        maintaining optimal partition sizes and accurate 2-ring neighborhoods.
+        
+        Args:
+            vertices: Input mesh vertices (list of [x, y, z])
+            faces: Input mesh faces (list of [v1, v2, v3])
+            mode: Splitting mode ("subremeshing" or "histogram")
+            max_iter: Maximum iterations
+            use_partitioning: Whether to use octree partitioning with 2-ring neighborhoods
+            
+        Returns:
+            Tuple of (split_vertices, split_faces)
+        """
+        current_vertices = vertices
+        current_faces = faces
+        
+        print(f"\n=== Iterative Edge Splitting (Dynamic Adaptation) ===")
+        print(f"Initial mesh: {len(vertices)} vertices, {len(faces)} faces")
+        print(f"Mode: {mode}, Max iterations: {max_iter}")
+        print(f"Use partitioning: {use_partitioning}")
+        
+        for iteration in range(max_iter):
+            print(f"\n--- Iteration {iteration + 1}/{max_iter} ---")
+            
+            if use_partitioning:
+                # Recalculate partitions based on current mesh
+                faces_np = np.array(current_faces, dtype=np.int32)
+                num_edges = self.count_edges(faces_np)
+                depth = self.calculate_octree_depth(num_edges)
+                num_partitions = 8 ** depth
+                
+                print(f"Current mesh: {len(current_vertices)} vertices, {len(current_faces)} faces, {num_edges} edges")
+                print(f"Recalculated octree depth: {depth} (8^{depth} = {num_partitions} partitions)")
+            else:
+                num_partitions = 8
+            
+            # Perform one iteration of edge splitting
+            splitter = EdgeSplitter(use_partitioning=use_partitioning, 
+                                   num_partitions=num_partitions)
+            splitter.initialize(current_vertices, current_faces)
+            current_vertices, current_faces = splitter.split_edges(mode=mode, max_iter=1)
+            
+            print(f"After iteration {iteration + 1}: {len(current_vertices)} vertices, {len(current_faces)} faces")
+        
+        print(f"\n=== Iterative Splitting Complete ===")
+        print(f"Final mesh: {len(current_vertices)} vertices, {len(current_faces)} faces")
+        print(f"Total increase: {len(current_vertices) - len(vertices)} vertices")
+        
+        return current_vertices, current_faces
+    
     def process_mesh_file(self, input_path: str, output_dir: str,
                          operation: str = "simplify", **kwargs):
         """
@@ -239,13 +319,23 @@ class CombinedMeshProcessor:
             mode = kwargs.get('mode', 'histogram')
             max_iter = kwargs.get('max_iter', 3)
             use_partitioning = kwargs.get('use_partitioning', True)
+            use_iterative = kwargs.get('use_iterative', False)  # New: use iterative approach
             num_partitions = kwargs.get('num_partitions', None)
             
-            split_vertices, split_faces = self.split_edges_mesh(
-                vertices if operation == "both" else vertices_np.tolist(),
-                faces if operation == "both" else faces_np.tolist(),
-                mode, max_iter, use_partitioning, num_partitions
-            )
+            if use_iterative:
+                # Use iterative splitting with dynamic adaptation
+                split_vertices, split_faces = self.split_edges_iterative(
+                    vertices if operation == "both" else vertices_np.tolist(),
+                    faces if operation == "both" else faces_np.tolist(),
+                    mode, max_iter, use_partitioning
+                )
+            else:
+                # Use standard splitting
+                split_vertices, split_faces = self.split_edges_mesh(
+                    vertices if operation == "both" else vertices_np.tolist(),
+                    faces if operation == "both" else faces_np.tolist(),
+                    mode, max_iter, use_partitioning, num_partitions
+                )
             
             # Save split mesh
             suffix = "_split" if operation == "split" else "_simplified_split"
@@ -264,6 +354,7 @@ class CombinedMeshProcessor:
             output_dir: Directory for output files
             operation: Operation to perform ("simplify", "split", or "both")
             **kwargs: Additional arguments passed to process_mesh_file
+                - use_iterative (bool): Use iterative approach with dynamic 2-ring recalculation
         """
         if not os.path.exists(input_dir):
             print(f"Error: Input directory does not exist: {input_dir}")
@@ -295,8 +386,10 @@ def main():
     """
     Main function demonstrating usage of the combined mesh processor.
     
-    This demonstrates partitioning with 2-ring neighborhoods (following mesh_simplification_mdd_lme.py)
-    and applying both simplification and edge splitting to the partitioned mesh.
+    Demonstrates:
+    1. Dynamic octree depth calculation based on edge count
+    2. Iterative processing with 2-ring neighborhood recalculation
+    3. Both simplification and edge splitting operations
     """
     # Configuration
     input_folder = "demo/data"
@@ -324,7 +417,10 @@ def main():
     # Process all meshes in the input directory
     print("\n" + "="*80)
     print("Combined Mesh Processing Tool")
-    print("Using mesh_simplification_mdd_lme.py partitioning approach")
+    print("Features:")
+    print("  - Dynamic octree depth: depth = max(1, ceil(log(edges/target_edges, 8)))")
+    print("  - Iterative processing with 2-ring neighborhood recalculation")
+    print("  - Following mesh_simplication_mdd_lme_new.py approach")
     print("="*80)
     print(f"Target edges per partition: {target_edges_per_partition}")
     print(f"Partitioning: Octree with 2-ring neighborhoods")
@@ -339,18 +435,30 @@ def main():
         target_ratio=0.5
     )
     
-    # Example 2: Edge splitting only
-    print("\n\n### Example 2: Edge Splitting ###")
+    # Example 2: Edge splitting with standard approach
+    print("\n\n### Example 2: Edge Splitting (Standard) ###")
     processor.process_directory(
         input_folder, output_folder,
         operation="split",
         mode="histogram",
         max_iter=3,
-        use_partitioning=True
+        use_partitioning=True,
+        use_iterative=False
     )
     
-    # Example 3: Both simplification and splitting
-    print("\n\n### Example 3: Simplification + Edge Splitting ###")
+    # Example 3: Edge splitting with iterative approach
+    print("\n\n### Example 3: Edge Splitting (Iterative with Dynamic Adaptation) ###")
+    processor.process_directory(
+        input_folder, output_folder,
+        operation="split",
+        mode="histogram",
+        max_iter=3,
+        use_partitioning=True,
+        use_iterative=True  # Enable iterative approach
+    )
+    
+    # Example 4: Both simplification and splitting
+    print("\n\n### Example 4: Simplification + Edge Splitting ###")
     processor.process_directory(
         input_folder, output_folder,
         operation="both",
