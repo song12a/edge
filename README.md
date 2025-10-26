@@ -2,17 +2,25 @@
 
 This repository implements a mesh simplification algorithm based on the concepts of **MDD (Minimal Simplification Domain)** and **LME (Local Minimal Edges)** from the paper on out-of-core mesh simplification, with support for **2-ring neighborhoods** for accurate QEM-based simplification.
 
+It also includes **Edge Splitting with Octree Partitioning** for mesh refinement with boundary preservation.
+
 ## Overview
 
-The implementation provides a modular approach to mesh simplification that:
+The implementation provides a modular approach to mesh processing:
 
+### Mesh Simplification
 1. **Partitions** large meshes into smaller sub-meshes (MDD - Minimal Simplification Domain) with 2-ring neighborhood support
 2. **Simplifies** each sub-mesh independently using QEM with border preservation (LME - Local Minimal Edges)
 3. **Merges** the simplified sub-meshes back into a single coherent output mesh
 
+### Edge Splitting (New)
+1. **Partitions** meshes using octree spatial subdivision (optional)
+2. **Splits** edges in each partition while preserving boundary vertices
+3. **Merges** split partitions back into a single refined mesh
+
 This approach is particularly useful for:
 - Processing very large meshes that don't fit in memory
-- Parallel simplification of mesh partitions
+- Parallel processing of mesh partitions
 - Preserving geometric details at partition boundaries
 - Ensuring accurate QEM calculations with topological context
 
@@ -29,6 +37,21 @@ The implementation now includes topology-based 2-ring neighborhood calculation f
 
 This satisfies the requirements of the Minimal Simplification Domain (MDD) as described in the paper "Out-of-Core Framework for QEM-based Mesh Simplification."
 
+### Edge Splitting with Octree Partitioning (New)
+
+The edge splitting implementation supports two operational modes:
+
+- **Without Partitioning**: Original behavior, splits edges across the entire mesh
+- **With Octree Partitioning**: Divides mesh into 8 spatial partitions, only splits interior vertices
+
+**Key features:**
+- Octree-based dynamic partitioning
+- Boundary vertex preservation (border vertices are not split)
+- Two splitting modes: Subremeshing and Histogram
+- Full backward compatibility with original behavior
+
+See [EDGE_SPLIT_PARTITIONING.md](EDGE_SPLIT_PARTITIONING.md) for detailed documentation.
+
 ## Files
 
 - **`QEM.py`**: Base implementation of Quadric Error Metric (QEM) mesh simplification
@@ -42,11 +65,21 @@ This satisfies the requirements of the Minimal Simplification Domain (MDD) as de
   - `MeshMerger`: Merges simplified sub-meshes with deduplication
   - Command-line interface for processing PLY files
 
+- **`edge_split.py`**: Edge splitting implementation with octree partitioning support (New)
+  - `MeshPartitioner`: Octree-based mesh partitioning (adapted from mesh_simplification_mdd_lme.py)
+  - `EdgeSplitter`: Edge splitting with two modes (Subremeshing and Histogram)
+  - Supports both partitioned and non-partitioned operation
+  - See [EDGE_SPLIT_PARTITIONING.md](EDGE_SPLIT_PARTITIONING.md) for details
+
 - **`create_test_mesh.py`**: Utility to generate test meshes (simple and subdivided cubes)
 
 - **`examples.py`**: Comprehensive examples demonstrating various usage patterns
 
 - **`test_2ring_neighborhood.py`**: Test suite for validating 2-ring neighborhood implementation
+
+- **`test_edge_split.py`**: Test suite for edge splitting (backward compatibility)
+
+- **`test_edge_split_partitioning.py`**: Test suite for edge splitting with partitioning (New)
 
 ## Installation
 
@@ -91,6 +124,7 @@ num_partitions = 8          # Octree partitioning (2x2x2)
 
 ### Using as a Library
 
+**Mesh Simplification:**
 ```python
 from mesh_simplification_mdd_lme import simplify_mesh_with_partitioning
 from QEM import PLYReader, PLYWriter
@@ -108,6 +142,27 @@ simplified_vertices, simplified_faces = simplify_mesh_with_partitioning(
 
 # Write output mesh
 PLYWriter.write_ply("output.ply", simplified_vertices, simplified_faces)
+```
+
+**Edge Splitting (New):**
+```python
+from edge_split import EdgeSplitter, PLYReader, PLYWriter
+
+# Read input mesh
+vertices, faces = PLYReader.read_ply("input.ply")
+
+# Method 1: Without partitioning (original behavior)
+splitter = EdgeSplitter(use_partitioning=False)
+splitter.initialize(vertices, faces)
+new_vertices, new_faces = splitter.split_edges(mode="subremeshing", max_iter=1)
+
+# Method 2: With octree partitioning (preserves boundaries)
+splitter = EdgeSplitter(use_partitioning=True, num_partitions=8)
+splitter.initialize(vertices, faces)
+new_vertices, new_faces = splitter.split_edges(mode="histogram", max_iter=3)
+
+# Write output mesh
+PLYWriter.write_ply("output.ply", new_vertices, new_faces)
 ```
 
 ## Algorithm Details
