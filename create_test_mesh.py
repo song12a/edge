@@ -150,7 +150,7 @@ def create_subdivided_cube(subdivisions=2):
 if __name__ == "__main__":
     import os
     
-    output_dir = "/home/runner/work/border/border/demo/data"
+    output_dir = "demo/data"
     os.makedirs(output_dir, exist_ok=True)
     
     # Create simple cube
